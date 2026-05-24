@@ -14,6 +14,7 @@
 //   - Sanitiza paths (rechaza "..", absolutos, salida de root)
 //   - Sin dependencias externas
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -37,6 +38,26 @@ const ACCEPT_POLL_MS: u64 = 100;
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub root: PathBuf,
+    /// Habilita uploads PUT. Default: false (read-only).
+    pub writable: bool,
+    /// Tamaño maximo aceptado en uploads. Default: 16 MiB.
+    pub max_upload: u64,
+    /// Si TRUE, un PUT a un fichero existente lo sobreescribe (200 OK).
+    /// Si FALSE, devuelve 409 Conflict salvo que la peticion incluya
+    /// "If-Match: *" para forzar la sobreescritura puntualmente.
+    pub overwrite: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 8088)),
+            root: PathBuf::from("./files"),
+            writable: false,
+            max_upload: 16 * 1024 * 1024,
+            overwrite: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +72,16 @@ pub enum ServerEvent {
         path: String,
         status: u16,
         bytes_sent: u64,
+        /// Bytes recibidos en el body (uploads). 0 para GET/HEAD.
+        bytes_received: u64,
+    },
+    /// Una subida PUT fue completada con exito.
+    UploadCompleted {
+        time: SystemTime,
+        peer: SocketAddr,
+        path: String,
+        bytes: u64,
+        overwrote: bool,
     },
     /// Algo no fatal — error de I/O, peticion malformada, etc.
     Warning(String),
@@ -66,6 +97,18 @@ pub struct Server {
     join: Option<JoinHandle<()>>,
     local_addr: SocketAddr,
     root: PathBuf,
+    writable: Arc<AtomicBool>,
+    overwrite: Arc<AtomicBool>,
+}
+
+/// Estado runtime mutable del servidor (writable, overwrite, etc.) compartido
+/// entre el thread accept y los workers. Permite que la GUI cambie el toggle
+/// "Allow uploads" sin reiniciar el server.
+#[derive(Clone)]
+struct SharedState {
+    writable: Arc<AtomicBool>,
+    overwrite: Arc<AtomicBool>,
+    max_upload: u64,
 }
 
 impl Server {
@@ -86,9 +129,18 @@ impl Server {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel::<ServerEvent>();
 
+        let writable = Arc::new(AtomicBool::new(cfg.writable));
+        let overwrite = Arc::new(AtomicBool::new(cfg.overwrite));
+        let shared = SharedState {
+            writable: Arc::clone(&writable),
+            overwrite: Arc::clone(&overwrite),
+            max_upload: cfg.max_upload,
+        };
+
         let stop_for_thread = Arc::clone(&stop_flag);
         let root_for_thread = root.clone();
         let tx_for_thread = tx.clone();
+        let shared_for_thread = shared.clone();
 
         let _ = tx.send(ServerEvent::Started {
             local_addr,
@@ -98,7 +150,13 @@ impl Server {
         let join = thread::Builder::new()
             .name("nthttp-accept".to_string())
             .spawn(move || {
-                accept_loop(listener, root_for_thread, stop_for_thread, tx_for_thread);
+                accept_loop(
+                    listener,
+                    root_for_thread,
+                    shared_for_thread,
+                    stop_for_thread,
+                    tx_for_thread,
+                );
             })?;
 
         Ok(Server {
@@ -107,7 +165,27 @@ impl Server {
             join: Some(join),
             local_addr,
             root,
+            writable,
+            overwrite,
         })
+    }
+
+    /// Activa / desactiva uploads en caliente (sin reiniciar el servidor).
+    pub fn set_writable(&self, enabled: bool) {
+        self.writable.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Activa / desactiva sobreescritura automatica de uploads existentes.
+    pub fn set_overwrite(&self, enabled: bool) {
+        self.overwrite.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.writable.load(Ordering::SeqCst)
+    }
+
+    pub fn is_overwrite(&self) -> bool {
+        self.overwrite.load(Ordering::SeqCst)
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -212,6 +290,7 @@ impl ToSocketAddrsSafe for (&str, u16) {
 fn accept_loop(
     listener: TcpListener,
     root: PathBuf,
+    shared: SharedState,
     stop_flag: Arc<AtomicBool>,
     tx: Sender<ServerEvent>,
 ) {
@@ -221,9 +300,11 @@ fn accept_loop(
             Ok((stream, peer)) => {
                 let _ = stream.set_nonblocking(false);
                 let root = Arc::clone(&root);
+                let shared = shared.clone();
                 let tx = tx.clone();
+                let tx_for_upload = tx.clone();
                 thread::spawn(move || {
-                    let result = handle_connection(stream, peer, &root);
+                    let result = handle_connection(stream, peer, &root, &shared, &tx_for_upload);
                     match result {
                         Ok(req) => {
                             let _ = tx.send(ServerEvent::Request {
@@ -233,6 +314,7 @@ fn accept_loop(
                                 path: req.path,
                                 status: req.status,
                                 bytes_sent: req.bytes_sent,
+                                bytes_received: req.bytes_received,
                             });
                         }
                         Err(e) => {
@@ -265,12 +347,15 @@ struct HandledRequest {
     path: String,
     status: u16,
     bytes_sent: u64,
+    bytes_received: u64,
 }
 
 fn handle_connection(
     mut stream: TcpStream,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     root: &Path,
+    shared: &SharedState,
+    tx: &Sender<ServerEvent>,
 ) -> std::io::Result<HandledRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))?;
     stream.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECS)))?;
@@ -284,53 +369,74 @@ fn handle_connection(
                 path: format!("(bad: {})", e),
                 status: 400,
                 bytes_sent: sent,
+                bytes_received: 0,
             });
         }
     };
 
-    if req.method != "GET" && req.method != "HEAD" {
-        let sent = write_error(&mut stream, 405, "Method Not Allowed", "Solo GET/HEAD\n")?;
-        return Ok(HandledRequest {
-            method: req.method,
-            path: req.path,
-            status: 405,
-            bytes_sent: sent,
-        });
+    // Dispatch por metodo
+    match req.method.as_str() {
+        "GET" | "HEAD" => handle_get(&mut stream, &req, root),
+        "PUT" => handle_put(&mut stream, &req, root, shared, peer, tx),
+        _ => {
+            let sent = write_error(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "Allowed: GET, HEAD, PUT\n",
+            )?;
+            Ok(HandledRequest {
+                method: req.method,
+                path: req.path,
+                status: 405,
+                bytes_sent: sent,
+                bytes_received: 0,
+            })
+        }
     }
+}
 
+fn handle_get(
+    stream: &mut TcpStream,
+    req: &Request,
+    root: &Path,
+) -> std::io::Result<HandledRequest> {
     let decoded = match url_decode(&req.path_only()) {
         Some(d) => d,
         None => {
-            let sent = write_error(&mut stream, 400, "Bad Request", "URL invalida\n")?;
+            let sent = write_error(stream, 400, "Bad Request", "URL invalida\n")?;
             return Ok(HandledRequest {
-                method: req.method,
-                path: req.path,
+                method: req.method.clone(),
+                path: req.path.clone(),
                 status: 400,
                 bytes_sent: sent,
+                bytes_received: 0,
             });
         }
     };
 
     // Endpoint especial maquina-friendly
     if decoded == "/_list" || decoded == "/_list/" {
-        let sent = serve_machine_list(&mut stream, root, req.method == "HEAD")?;
+        let sent = serve_machine_list(stream, root, req.method == "HEAD")?;
         return Ok(HandledRequest {
-            method: req.method,
-            path: req.path,
+            method: req.method.clone(),
+            path: req.path.clone(),
             status: 200,
             bytes_sent: sent,
+            bytes_received: 0,
         });
     }
 
     let rel = match safe_rel_path(&decoded) {
         Some(p) => p,
         None => {
-            let sent = write_error(&mut stream, 403, "Forbidden", "Ruta no permitida\n")?;
+            let sent = write_error(stream, 403, "Forbidden", "Ruta no permitida\n")?;
             return Ok(HandledRequest {
-                method: req.method,
-                path: req.path,
+                method: req.method.clone(),
+                path: req.path.clone(),
                 status: 403,
                 bytes_sent: sent,
+                bytes_received: 0,
             });
         }
     };
@@ -340,50 +446,377 @@ fn handle_connection(
     let canon = match fs::canonicalize(&full) {
         Ok(c) => c,
         Err(_) => {
-            let sent = write_error(&mut stream, 404, "Not Found", "No existe\n")?;
+            // Sin fichero — pero comprobamos si hay un .part en curso, para
+            // que el cliente pueda decidir si reanudar.
+            let part_path = with_part_extension(&full);
+            if let Ok(meta) = fs::metadata(&part_path) {
+                if meta.is_file() {
+                    // 404 + cabecera X-Resume-Offset para que el cliente sepa
+                    // cuantos bytes ya tiene el server.
+                    let header = format!(
+                        "HTTP/1.0 404 Not Found\r\n\
+                         Content-Type: text/plain; charset=utf-8\r\n\
+                         Content-Length: 19\r\n\
+                         X-Resume-Offset: {}\r\n\
+                         Connection: close\r\n\r\n\
+                         Partial upload\n   ",
+                        meta.len()
+                    );
+                    let bytes = header.as_bytes();
+                    stream.write_all(bytes)?;
+                    return Ok(HandledRequest {
+                        method: req.method.clone(),
+                        path: req.path.clone(),
+                        status: 404,
+                        bytes_sent: bytes.len() as u64,
+                        bytes_received: 0,
+                    });
+                }
+            }
+            let sent = write_error(stream, 404, "Not Found", "No existe\n")?;
             return Ok(HandledRequest {
-                method: req.method,
-                path: req.path,
+                method: req.method.clone(),
+                path: req.path.clone(),
                 status: 404,
                 bytes_sent: sent,
+                bytes_received: 0,
             });
         }
     };
     if !canon.starts_with(root) {
-        let sent = write_error(&mut stream, 403, "Forbidden", "Fuera de raiz\n")?;
+        let sent = write_error(stream, 403, "Forbidden", "Fuera de raiz\n")?;
         return Ok(HandledRequest {
-            method: req.method,
-            path: req.path,
+            method: req.method.clone(),
+            path: req.path.clone(),
             status: 403,
             bytes_sent: sent,
+            bytes_received: 0,
         });
     }
 
     let meta = fs::metadata(&canon)?;
 
     if meta.is_dir() {
-        let sent = serve_listing(&mut stream, root, &canon, req.method == "HEAD")?;
+        let sent = serve_listing(stream, root, &canon, req.method == "HEAD")?;
         return Ok(HandledRequest {
-            method: req.method,
-            path: req.path,
+            method: req.method.clone(),
+            path: req.path.clone(),
             status: 200,
             bytes_sent: sent,
+            bytes_received: 0,
         });
     }
 
     let (status, sent) = serve_file(
-        &mut stream,
+        stream,
         &canon,
         meta.len(),
-        req.range,
+        req.range(),
         req.method == "HEAD",
     )?;
     Ok(HandledRequest {
-        method: req.method,
-        path: req.path,
+        method: req.method.clone(),
+        path: req.path.clone(),
         status,
         bytes_sent: sent,
+        bytes_received: 0,
     })
+}
+
+//─────────────────────────────────────────────────────────────────
+// PUT — subida de ficheros
+//
+// Soporte:
+//   - PUT plano:  cuerpo entero -> .part -> rename a final
+//   - PUT con Content-Range "bytes N-M/total": resume (escribir en offset N)
+//   - If-Match: * fuerza sobreescritura aunque overwrite=false
+//─────────────────────────────────────────────────────────────────
+
+fn handle_put(
+    stream: &mut TcpStream,
+    req: &Request,
+    root: &Path,
+    shared: &SharedState,
+    peer: SocketAddr,
+    tx: &Sender<ServerEvent>,
+) -> std::io::Result<HandledRequest> {
+    // 1. Writable?
+    if !shared.writable.load(Ordering::SeqCst) {
+        let sent = write_error(stream, 403, "Forbidden", "Server is read-only\n")?;
+        return Ok(HandledRequest {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            status: 403,
+            bytes_sent: sent,
+            bytes_received: 0,
+        });
+    }
+
+    // 2. Content-Length obligatorio
+    let body_len = match req.content_length() {
+        Some(n) => n,
+        None => {
+            let sent = write_error(stream, 411, "Length Required", "Content-Length required\n")?;
+            return Ok(HandledRequest {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                status: 411,
+                bytes_sent: sent,
+                bytes_received: 0,
+            });
+        }
+    };
+
+    if body_len > shared.max_upload {
+        let sent = write_error(stream, 413, "Payload Too Large", "Upload exceeds limit\n")?;
+        // Tenemos que drenar el body, pero como vamos a cerrar, simplemente
+        // cerramos la conexion sin leerlo (la otra parte vera el RST).
+        return Ok(HandledRequest {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            status: 413,
+            bytes_sent: sent,
+            bytes_received: 0,
+        });
+    }
+
+    // 3. Path validation
+    let decoded = match url_decode(&req.path_only()) {
+        Some(d) => d,
+        None => {
+            let sent = write_error(stream, 400, "Bad Request", "URL invalida\n")?;
+            return Ok(HandledRequest {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                status: 400,
+                bytes_sent: sent,
+                bytes_received: 0,
+            });
+        }
+    };
+    let rel = match safe_rel_path_for_put(&decoded) {
+        Some(p) => p,
+        None => {
+            let sent = write_error(stream, 400, "Bad Request", "Bad path\n")?;
+            return Ok(HandledRequest {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                status: 400,
+                bytes_sent: sent,
+                bytes_received: 0,
+            });
+        }
+    };
+    let dest = root.join(&rel);
+    let part = with_part_extension(&dest);
+
+    // 4. Content-Range (resume) — opcional
+    let (write_offset, expected_total) = match req.content_range() {
+        Some((start, end, total)) => {
+            // Validaciones basicas
+            let span = end.checked_sub(start).and_then(|x| x.checked_add(1));
+            if span != Some(body_len) {
+                let sent = write_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "Content-Range/Content-Length mismatch\n",
+                )?;
+                return Ok(HandledRequest {
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    status: 400,
+                    bytes_sent: sent,
+                    bytes_received: 0,
+                });
+            }
+            // El offset de escritura debe casar con la longitud actual del .part
+            let current = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            if start != current {
+                let header = format!(
+                    "HTTP/1.0 416 Range Not Satisfiable\r\n\
+                     Content-Range: bytes */{}\r\n\
+                     X-Resume-Offset: {}\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n",
+                    total, current
+                );
+                stream.write_all(header.as_bytes())?;
+                return Ok(HandledRequest {
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    status: 416,
+                    bytes_sent: header.len() as u64,
+                    bytes_received: 0,
+                });
+            }
+            (start, total)
+        }
+        None => {
+            // Sin Content-Range: PUT entero desde 0. Si existe un .part de un
+            // intento previo, lo borramos para empezar limpio.
+            let _ = fs::remove_file(&part);
+            (0u64, body_len)
+        }
+    };
+
+    // 5. Politica de colision (solo en el momento del PUT inicial completo)
+    let overwriting = dest.exists();
+    if overwriting && write_offset == 0 {
+        let force = req.force_overwrite();
+        let allow_overwrite = shared.overwrite.load(Ordering::SeqCst) || force;
+        if !allow_overwrite {
+            let sent = write_error(
+                stream,
+                409,
+                "Conflict",
+                "File exists; use If-Match: * to overwrite or rename\n",
+            )?;
+            return Ok(HandledRequest {
+                method: req.method.clone(),
+                path: req.path.clone(),
+                status: 409,
+                bytes_sent: sent,
+                bytes_received: 0,
+            });
+        }
+    }
+
+    // 6. Stream body -> .part (append-mode si offset>0)
+    let mut f = if write_offset == 0 {
+        fs::File::create(&part)?
+    } else {
+        let mut f = fs::OpenOptions::new().write(true).append(false).open(&part)?;
+        f.seek(SeekFrom::Start(write_offset))?;
+        f
+    };
+
+    let mut buf = [0u8; 8192];
+    let mut left = body_len;
+    let mut received: u64 = 0;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = match stream.read(&mut buf[..want]) {
+            Ok(0) => {
+                // Cliente cerró antes de tiempo — .part queda; quizas reanude
+                drop(f);
+                let sent = write_error(stream, 400, "Bad Request", "Truncated body\n")?;
+                let _ = tx.send(ServerEvent::Warning(format!(
+                    "[{}] upload truncated at {}/{} bytes for {:?}",
+                    peer, received, body_len, dest
+                )));
+                return Ok(HandledRequest {
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    status: 400,
+                    bytes_sent: sent,
+                    bytes_received: received,
+                });
+            }
+            Ok(n) => n,
+            Err(e) => {
+                drop(f);
+                let _ = tx.send(ServerEvent::Warning(format!(
+                    "[{}] upload read error after {} bytes: {}",
+                    peer, received, e
+                )));
+                return Err(e);
+            }
+        };
+        f.write_all(&buf[..n])?;
+        received += n as u64;
+        left -= n as u64;
+    }
+    f.sync_all()?;
+    drop(f);
+
+    // 7. Rename .part -> final si esta completo
+    let part_size = fs::metadata(&part)?.len();
+    if part_size >= expected_total {
+        // Completo. Renombramos atomicamente.
+        if dest.exists() {
+            let _ = fs::remove_file(&dest);
+        }
+        fs::rename(&part, &dest)?;
+        let status = if overwriting { 200 } else { 201 };
+        let status_text = if overwriting { "OK" } else { "Created" };
+        let body = format!("{}\n", req.path_only());
+        let header = format!(
+            "HTTP/1.0 {} {}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            status,
+            status_text,
+            body.len()
+        );
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(body.as_bytes())?;
+
+        let _ = tx.send(ServerEvent::UploadCompleted {
+            time: SystemTime::now(),
+            peer,
+            path: req.path_only(),
+            bytes: part_size,
+            overwrote: overwriting,
+        });
+
+        Ok(HandledRequest {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            status,
+            bytes_sent: (header.len() + body.len()) as u64,
+            bytes_received: received,
+        })
+    } else {
+        // Parcial: respondemos 202 Accepted indicando cuantos bytes tenemos.
+        let body = format!("Partial: {} of {}\n", part_size, expected_total);
+        let header = format!(
+            "HTTP/1.0 202 Accepted\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             X-Resume-Offset: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len(),
+            part_size
+        );
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(body.as_bytes())?;
+        Ok(HandledRequest {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            status: 202,
+            bytes_sent: (header.len() + body.len()) as u64,
+            bytes_received: received,
+        })
+    }
+}
+
+/// Path validation especifica para PUT — solo permite ficheros sin
+/// subdirectorios (sin slashes). Mas restrictivo que GET pero mas seguro.
+fn safe_rel_path_for_put(url_path: &str) -> Option<PathBuf> {
+    let trimmed = url_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return None;
+    }
+    if trimmed.contains("..") {
+        return None;
+    }
+    // Nombres reservados / vacios
+    if trimmed == "." || trimmed.starts_with('.') {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Devuelve `<path>.part` para un fichero. Usado durante uploads.
+fn with_part_extension(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".part");
+    PathBuf::from(s)
 }
 
 //─────────────────────────────────────────────────────────────────
@@ -393,7 +826,7 @@ fn handle_connection(
 struct Request {
     method: String,
     path: String,
-    range: Option<(u64, Option<u64>)>,
+    headers: HashMap<String, String>,  // claves lowercased
 }
 
 impl Request {
@@ -402,6 +835,29 @@ impl Request {
             Some(q) => self.path[..q].to_string(),
             None => self.path.clone(),
         }
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+    }
+
+    /// Range header (para GET): (start, Option<end>)
+    fn range(&self) -> Option<(u64, Option<u64>)> {
+        parse_range(self.header("range")?)
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        self.header("content-length")?.trim().parse().ok()
+    }
+
+    /// Content-Range header (para PUT): (start, end, total)
+    fn content_range(&self) -> Option<(u64, u64, u64)> {
+        parse_content_range(self.header("content-range")?)
+    }
+
+    /// If-Match: * fuerza sobreescritura
+    fn force_overwrite(&self) -> bool {
+        self.header("if-match").map(|v| v.trim() == "*").unwrap_or(false)
     }
 }
 
@@ -444,25 +900,34 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
         ));
     }
 
-    let mut range = None;
+    let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
         if line.is_empty() {
             continue;
         }
         if let Some(colon) = line.find(':') {
-            let name = line[..colon].trim();
-            let value = line[colon + 1..].trim();
-            if name.eq_ignore_ascii_case("Range") {
-                range = parse_range(value);
-            }
+            let name = line[..colon].trim().to_ascii_lowercase();
+            let value = line[colon + 1..].trim().to_string();
+            headers.insert(name, value);
         }
     }
 
     Ok(Request {
         method,
         path,
-        range,
+        headers,
     })
+}
+
+fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
+    let rest = v.trim().strip_prefix("bytes ")?;
+    let (range_part, total_part) = rest.split_once('/')?;
+    let (start_s, end_s) = range_part.split_once('-')?;
+    Some((
+        start_s.trim().parse().ok()?,
+        end_s.trim().parse().ok()?,
+        total_part.trim().parse().ok()?,
+    ))
 }
 
 fn parse_range(v: &str) -> Option<(u64, Option<u64>)> {

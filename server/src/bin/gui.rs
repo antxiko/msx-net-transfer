@@ -10,6 +10,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -20,6 +21,8 @@ use nettransfer_server::{local_ipv4s, Server, ServerConfig, ServerEvent};
 
 const DEFAULT_PORT: u16 = 8088;
 const DEFAULT_FOLDER: &str = "./files";
+const MAX_UPLOAD_DEFAULT: u64 = 16 * 1024 * 1024;  // 16 MiB
+const UPLOAD_LOG_MAX: usize = 20;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Theme {
@@ -34,6 +37,14 @@ enum ViewMode {
     Icons,    // grid con iconos grandes
 }
 
+struct UploadEntry {
+    when: String,         // HH:MM:SS local
+    peer: String,
+    path: String,
+    bytes: u64,
+    overwrote: bool,
+}
+
 struct App {
     folder: PathBuf,
     server: Option<Server>,
@@ -44,6 +55,10 @@ struct App {
     view_mode: ViewMode,
     request_count: u64,
     last_request: Option<String>,
+    // Permisos de upload — se aplican al arrancar y en caliente
+    allow_uploads: bool,
+    allow_overwrite: bool,
+    upload_log: VecDeque<UploadEntry>,
 }
 
 impl App {
@@ -64,6 +79,9 @@ impl App {
             view_mode: ViewMode::Columns,
             request_count: 0,
             last_request: None,
+            allow_uploads: false,         // por defecto, read-only
+            allow_overwrite: false,
+            upload_log: VecDeque::with_capacity(UPLOAD_LOG_MAX),
         };
         app.refresh_files();
         app
@@ -93,6 +111,9 @@ impl App {
         let cfg = ServerConfig {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
             root: self.folder.clone(),
+            writable: self.allow_uploads,
+            max_upload: MAX_UPLOAD_DEFAULT,
+            overwrite: self.allow_overwrite,
         };
         match Server::start(cfg) {
             Ok(s) => {
@@ -107,6 +128,14 @@ impl App {
         }
     }
 
+    /// Aplica los toggles de permisos al servidor en caliente.
+    fn sync_permissions(&mut self) {
+        if let Some(s) = &self.server {
+            s.set_writable(self.allow_uploads);
+            s.set_overwrite(self.allow_overwrite);
+        }
+    }
+
     fn stop(&mut self) {
         if let Some(s) = self.server.take() {
             s.stop();
@@ -114,8 +143,15 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        let Some(server) = &self.server else { return; };
-        while let Some(ev) = server.try_recv() {
+        // Recopilamos eventos a un Vec antes de procesar, para evitar conflicto
+        // de borrow (algunas variantes llaman a self.refresh_files()).
+        let mut events: Vec<ServerEvent> = Vec::new();
+        if let Some(server) = &self.server {
+            while let Some(ev) = server.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
             match ev {
                 ServerEvent::Started { .. } => {}
                 ServerEvent::Request {
@@ -126,6 +162,21 @@ impl App {
                         "{} {} {} -> {} ({} B)",
                         peer, method, path, status, bytes_sent
                     ));
+                }
+                ServerEvent::UploadCompleted { peer, path, bytes, overwrote, .. } => {
+                    let entry = UploadEntry {
+                        when: short_time_now(),
+                        peer: peer.to_string(),
+                        path,
+                        bytes,
+                        overwrote,
+                    };
+                    self.upload_log.push_front(entry);
+                    while self.upload_log.len() > UPLOAD_LOG_MAX {
+                        self.upload_log.pop_back();
+                    }
+                    // Tras upload, refrescamos la lista local
+                    self.refresh_files();
                 }
                 ServerEvent::Warning(msg) => {
                     self.last_error = Some(msg);
@@ -151,6 +202,47 @@ impl eframe::App for App {
         // Si esta corriendo, pide repintar pronto para refrescar contadores.
         if self.is_running() {
             ctx.request_repaint_after(Duration::from_millis(300));
+        }
+
+        // ── Panel inferior: log de uploads recientes ──
+        if !self.upload_log.is_empty() {
+            egui::TopBottomPanel::bottom("uploads-panel")
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.collapsing(
+                        egui::RichText::new(format!(
+                            "📥 Uploads recientes ({})",
+                            self.upload_log.len()
+                        ))
+                        .strong(),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("uploads-grid")
+                                        .num_columns(4)
+                                        .striped(true)
+                                        .spacing([10.0, 3.0])
+                                        .show(ui, |ui| {
+                                            for u in &self.upload_log {
+                                                ui.monospace(&u.when);
+                                                ui.monospace(&u.path);
+                                                ui.monospace(human_size(u.bytes));
+                                                let label = if u.overwrote {
+                                                    egui::RichText::new(format!("⟳ over (from {})", u.peer))
+                                                        .color(egui::Color32::from_rgb(220, 160, 40))
+                                                } else {
+                                                    egui::RichText::new(format!("+ new (from {})", u.peer))
+                                                        .color(egui::Color32::from_rgb(80, 180, 80))
+                                                };
+                                                ui.label(label);
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        },
+                    );
+                });
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -208,6 +300,22 @@ impl eframe::App for App {
                             ui.weak(format!("Ultima: {}", last));
                         }
                     });
+                    ui.add_space(8.0);
+                    // Indicador de uploads
+                    let (icon, txt, color) = if self.allow_uploads {
+                        ("🔓", "UPLOADS ON", egui::Color32::from_rgb(220, 160, 40))
+                    } else {
+                        ("🔒", "READ-ONLY", egui::Color32::from_rgb(140, 140, 140))
+                    };
+                    let label = egui::RichText::new(format!("{}  {}", icon, txt))
+                        .color(egui::Color32::WHITE)
+                        .size(13.0)
+                        .strong();
+                    let frame = egui::Frame::none()
+                        .fill(color)
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .rounding(6.0);
+                    frame.show(ui, |ui| { ui.label(label); });
                 }
             });
 
@@ -241,6 +349,25 @@ impl eframe::App for App {
                         self.folder = p;
                         self.refresh_files();
                     }
+                }
+            });
+
+            ui.add_space(8.0);
+
+            // ── Permisos (uploads) ──
+            // Los toggles se pueden cambiar incluso con el server corriendo —
+            // se aplican en caliente via set_writable / set_overwrite.
+            ui.horizontal(|ui| {
+                let prev_uploads = self.allow_uploads;
+                let prev_overwrite = self.allow_overwrite;
+                ui.checkbox(&mut self.allow_uploads, "Permitir uploads (PUT)");
+                ui.add_space(12.0);
+                ui.add_enabled(
+                    self.allow_uploads,
+                    egui::Checkbox::new(&mut self.allow_overwrite, "Permitir sobreescritura"),
+                );
+                if prev_uploads != self.allow_uploads || prev_overwrite != self.allow_overwrite {
+                    self.sync_permissions();
                 }
             });
 
@@ -447,6 +574,19 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
         Theme::Dark => egui::Visuals::dark(),
     };
     ctx.set_visuals(visuals);
+}
+
+// HH:MM:SS local en formato ASCII puro, sin dependencias (chrono pesa mucho).
+fn short_time_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
 // Limpia un PathBuf para mostrar: en Windows quita el prefijo "\\?\" que
