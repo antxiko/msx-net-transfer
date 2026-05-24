@@ -25,18 +25,21 @@ Net Transfer is a tiny client/server pair that lets your MSX browse a folder on 
 ## Features
 
 - **Two-process design**: a small GUI/CLI server on the PC and a single `NT.COM` on the MSX.
-- **Cross-platform server**: native binaries for Windows, Linux and macOS, built in Rust.
-- **No protocol invention**: standard HTTP/1.0 — you can also browse the same folder from any web browser.
-- **Interactive MSX browser**: 80-column SCREEN 0 UI, arrow keys to navigate, `ENTER` to download, `R` to refresh, `ESC` to quit.
-- **Real binary transfer**: the server sends `Content-Length` and raw bytes; the MSX client streams straight to a file handle via MSX-DOS 2.
-- **Tiny client**: `NT.COM` fits comfortably under 16 KiB of resident code.
-- **Safe by default**: the server rejects `..` path components, absolute paths, and anything that would escape the served folder.
+- **Cross-platform server**: native binaries for Windows, Linux and macOS, built in Rust (eframe / egui).
+- **No protocol invention**: standard HTTP/1.0 — you can also browse the same folder from any web browser and `curl` works as a client too.
+- **Bidirectional**: download server → MSX (`GET`) and upload MSX → server (`PUT`), with optional resume (`Content-Range`).
+- **Dual-view MSX browser**: `S` shows the server's files, `L` shows the local MSX disk. `ENTER` downloads or uploads depending on the active view.
+- **Safe upload by default**: the server is read-only unless you explicitly enable uploads with `--writable` (CLI) or the *"Permitir uploads"* checkbox (GUI). Conflicting filenames return `409 Conflict` and the MSX prompts `(O)verwrite / (C)ancel`.
+- **Real binary transfer**: the server sends `Content-Length` and raw bytes; the MSX client streams straight to a file handle via MSX-DOS 2. The server writes uploads to a sidecar `.part` file and renames atomically on success.
+- **Tiny client**: `NT.COM` is around 8.5 KiB of compiled Z80 code (padded into a 32 KiB COM by MSXgl).
+- **Safe by default on paths**: the server rejects `..` path components, absolute paths, and anything that would escape the served folder. Uploads are restricted to direct children of the served folder (no subdirectories).
 
 ## How does it work?
 
-1. The server listens on TCP port **8088** and serves files from a folder you choose with a GUI button (or `cargo run` argument).
-2. The MSX runs `NT <ip>` (no port, no protocol — both are implicit). The client calls `GET /_list` to fetch a plain-text directory listing.
-3. You navigate the listing with the arrow keys and press `ENTER` to start the download. The client opens the target file with MSX-DOS 2's `_CREATE` function and streams the HTTP body straight to disk.
+1. The server listens on TCP port **8088** and serves files from a folder you choose with a GUI button (or a CLI argument).
+2. The MSX runs `NT <ip>` (no port, no protocol — both are implicit). The client calls `GET /_list` to fetch a plain-text directory listing and shows it in an 80-column browser.
+3. From the SERVER view (`S`), arrow keys + `ENTER` download the highlighted file to MSX disk. From the LOCAL view (`L`), the same gesture **uploads** the highlighted MSX file to the server with a `PUT` request.
+4. Uploads land on a sidecar `<file>.part` and are renamed to their final name only when the body is fully received — so half-finished transfers never leave a corrupted file on the server. If `Content-Range` is supplied, the server will append at the requested offset (resume).
 
 The MSX side talks to the network through any UNAPI TCP/IP 1.1 implementation: the [Obsonet](https://www.obsonet.com/) Ethernet card, GR8NET, an InterNestor stack on Caribbean, or the [openMSXnet](https://github.com/antxiko/openMSXnet) extension for the openMSX emulator (used to develop this project).
 
@@ -57,9 +60,11 @@ The GUI lets you pick the folder to share, start/stop the server with a single b
 If you prefer a command line server (e.g. for a Raspberry Pi without a desktop):
 
 ```bash
-nthttp                              # serves ./files on port 8080
-nthttp 8088                         # serves ./files on port 8088
-nthttp 8088 /home/me/msx-share      # custom port and folder
+nthttp                                          # serves ./files on port 8088 (read-only)
+nthttp 8088 /home/me/msx-share                  # custom port and folder
+nthttp 8088 /home/me/msx-share --writable       # allow uploads (PUT) — default 16 MiB max
+nthttp 8088 /home/me/msx-share --writable --overwrite   # allow PUT on existing files
+nthttp --help                                   # all flags
 ```
 
 ### 2. Install `NT.COM` on the MSX
@@ -82,22 +87,27 @@ The screen switches to 80-column mode and the file browser appears.
 
 ## Client keyboard
 
-| Key                  | Action                                  |
-| -------------------- | --------------------------------------- |
-| ↑ / ↓                | Move cursor by one item                 |
-| ← / →                | Jump to previous / next column          |
-| `ENTER`              | Download the highlighted file           |
-| `R`                  | Refresh the listing (server folder may have changed) |
-| `ESC`                | Quit and return to MSX-DOS prompt       |
+| Key                  | Action                                                                |
+| -------------------- | --------------------------------------------------------------------- |
+| ↑ / ↓                | Move cursor by one item                                               |
+| ← / →                | Jump to previous / next column                                        |
+| `S`                  | Switch to **server** view (remote files; ENTER downloads)             |
+| `L`                  | Switch to **local** view (MSX disk files; ENTER uploads)              |
+| `ENTER`              | Download the highlighted file (server view) **or** upload it (local view) |
+| `R`                  | Refresh the current listing (server folder or local disk)             |
+| `O` / `C`            | On a 409 conflict during upload: `O` overwrite, `C` cancel            |
+| `ESC`                | Cancel the in-flight upload, or quit and return to MSX-DOS prompt     |
 
-Filenames longer than 8.3 are converted to uppercase 8.3 when written to MSX disk — e.g. `dbg_startaddr.asc` is stored as `DBG_STAR.ASC`.
+Filenames longer than 8.3 are converted to uppercase 8.3 when written to MSX disk on download — e.g. `dbg_startaddr.asc` is stored as `DBG_STAR.ASC`. Uploads send the local 8.3 name verbatim to the server.
 
 ## Server GUI
 
-- **Large status badge**: green (`RUNNING`) or red (`STOPPED`) at a glance.
+- **Large status badge**: green (`RUNNING`) or red (`STOPPED`) at a glance, with a small companion indicator 🔓 `UPLOADS ON` / 🔒 `READ-ONLY`.
 - **Folder picker**: native file dialog on every platform.
-- **MSX command line**: shows exactly what to type on the MSX (no need to "copy IP" — you can't paste into an MSX anyway).
-- **File browser**: list / columns / icons view.
+- **MSX command line**: shows exactly what to type on the MSX (no need to "copy IP" — you can't paste into an MSX anyway). Only the real LAN IP is shown; virtual adapters (Docker, WSL, VirtualBox, Hyper-V) are filtered out.
+- **Permissions**: two checkboxes — *Permitir uploads* and *Permitir sobreescritura* — that take effect **live** without restarting the server.
+- **Upload log**: collapsible bottom panel with the last 20 successful uploads (time, file, size, source IP, whether it overwrote a previous file).
+- **File browser**: list / columns / icons view, auto-refreshes after a successful upload so you can see new arrivals immediately.
 - **Theme toggle**: light or dark.
 
 The server is intentionally read-only. It exposes only `GET`/`HEAD` and never writes anything to disk.
@@ -157,15 +167,48 @@ NetTransfer/
 └── docs/                 # screenshots / extra docs
 ```
 
-## Endpoints exposed by the server
+## HTTP endpoints exposed by the server
 
-| Path        | Purpose                                                              |
-| ----------- | -------------------------------------------------------------------- |
-| `GET /`     | HTML directory listing (for browsing from any web browser)           |
-| `GET /<f>`  | Sends the file `<f>` with `Content-Length` and `application/octet-stream` |
-| `GET /_list`| Machine-readable plain text listing: one `name<TAB>size<LF>` per file. Used by `NT.COM`. |
+| Path / Method   | Purpose                                                              |
+| --------------- | -------------------------------------------------------------------- |
+| `GET /`         | HTML directory listing (for browsing from any web browser)           |
+| `GET /<f>`      | Sends the file `<f>` with `Content-Length` and `application/octet-stream`. Replies `404 Not Found` with an extra `X-Resume-Offset: N` header when a partial `.part` of size N exists. |
+| `GET /_list`    | Machine-readable plain text listing: one `name<TAB>size<LF>` per file. Used by `NT.COM`. |
+| `PUT /<f>`      | (when `--writable`) Uploads the body as `<f>`. Returns `201 Created` on success, `200 OK` when overwriting (with `--overwrite` or `If-Match: *`), `409 Conflict` otherwise. |
 
-Range requests (`Range: bytes=N-`) are supported and reply with `206 Partial Content`, so you can also use Net Transfer with any HTTP client that supports resumable downloads.
+`GET` supports `Range: bytes=N-` (replies `206 Partial Content`).
+`PUT` supports `Content-Range: bytes N-M/total` for resumable uploads — the server appends at offset N if it matches the current `.part` size, otherwise replies `416 Range Not Satisfiable` with an `X-Resume-Offset` hint.
+
+HTTP status codes used:
+
+| Code | When |
+| ---- | ---- |
+| `200 OK` | Successful overwrite on `PUT`, or `GET` of a complete file |
+| `201 Created` | New file successfully uploaded |
+| `202 Accepted` | Partial `PUT` accepted; `.part` not yet complete |
+| `206 Partial Content` | `GET` with `Range` |
+| `400 Bad Request` | Malformed request or unsafe path |
+| `403 Forbidden` | Path escapes root, or `PUT` when server is read-only |
+| `404 Not Found` | File doesn't exist (may include `X-Resume-Offset` if a `.part` is around) |
+| `405 Method Not Allowed` | Method other than `GET / HEAD / PUT` |
+| `409 Conflict` | `PUT` to an existing file without overwrite permission |
+| `411 Length Required` | `PUT` without `Content-Length` |
+| `413 Payload Too Large` | `PUT` body exceeds `--max-upload` |
+| `416 Range Not Satisfiable` | `PUT` `Content-Range` doesn't match current `.part` size |
+
+### Example: upload from curl
+
+```bash
+# Server: nthttp 8088 ./files --writable
+curl -X PUT --data-binary @local.bin -H "Content-Type: application/octet-stream" \
+  http://192.168.0.102:8088/REMOTE.BIN
+# → HTTP/1.0 201 Created
+
+# Overwrite an existing file:
+curl -X PUT --data-binary @local.bin -H "If-Match: *" \
+  http://192.168.0.102:8088/REMOTE.BIN
+# → HTTP/1.0 200 OK
+```
 
 ## Credits
 

@@ -1,5 +1,5 @@
 //=============================================================================
-// nt.c — MSX Net Transfer 0.1.0 — cliente HTTP para MSX-DOS 2
+// nt.c — MSX Net Transfer 0.2.0 — cliente HTTP para MSX-DOS 2
 //
 // Uso:
 //     NT <ip>
@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.1.0"
+#define NT_VERSION       "0.2.0"
 #define NT_PORT          8088
 #define MAX_FILES        64
 #define NAME_LEN         28          // 27 + NUL
@@ -49,10 +49,16 @@ typedef struct {
     u32 size;
 } FileEntry;
 
+// Modo de vista del navegador. SERVER = ficheros remotos (descarga con ENTER).
+// LOCAL = ficheros locales del MSX (subida con ENTER).
+#define VIEW_SERVER  0
+#define VIEW_LOCAL   1
+
 static FileEntry g_Files[MAX_FILES];
 static u8  g_FileCount;
 static u8  g_Selection;
 static u8  g_ScrollTop;
+static u8  g_ViewMode;             // VIEW_SERVER / VIEW_LOCAL
 static c8  g_ListBuf[LIST_BUF_SIZE];
 static u16 g_ListLen;
 
@@ -560,6 +566,64 @@ static bool RefreshList(void)
 }
 
 //─────────────────────────────────────────────────────────────────
+// Enumera los ficheros del directorio actual de MSX-DOS 2 con FFIRST/FNEXT
+// y rellena g_Files[]. Usado por la vista LOCAL para elegir que subir.
+//─────────────────────────────────────────────────────────────────
+static bool LocalListFill(void)
+{
+    DOS_FIB* fib;
+    g_FileCount = 0;
+    g_Selection = 0;
+    g_ScrollTop = 0;
+
+    fib = DOS_FindFirstEntry("*.*", 0);
+    while(fib && g_FileCount < MAX_FILES) {
+        // Saltar subdirectorios y entradas raras
+        if((fib->Attribute & ATTR_FOLDER) == 0 &&
+           (fib->Attribute & ATTR_DEVICE) == 0)
+        {
+            u8 k;
+            for(k = 0; k < NAME_LEN - 1 && fib->Filename[k]; k++) {
+                g_Files[g_FileCount].name[k] = fib->Filename[k];
+            }
+            g_Files[g_FileCount].name[k] = 0;
+            g_Files[g_FileCount].size = fib->Size;
+            g_FileCount++;
+        }
+        fib = DOS_FindNextEntry();
+    }
+    return TRUE;
+}
+
+//─────────────────────────────────────────────────────────────────
+// Construye una peticion PUT en g_ReqBuf. Devuelve su longitud.
+// Si forceOverwrite=TRUE incluye cabecera "If-Match: *" para que el
+// servidor sobreescriba aunque overwrite=false por defecto.
+//─────────────────────────────────────────────────────────────────
+static u16 BuildPutRequest(const c8* name, u32 size, bool forceOverwrite)
+{
+    u16 i = 0; const c8* s;
+    #define APPEND(S) do { s = (S); while(*s) g_ReqBuf[i++] = *s++; } while(0)
+
+    APPEND("PUT /");
+    { const c8* p = name; while(*p) g_ReqBuf[i++] = *p++; }
+    APPEND(" HTTP/1.0\r\nHost: ");
+    { const c8* h = g_HostHdr; while(*h) g_ReqBuf[i++] = *h++; }
+    APPEND("\r\nContent-Length: ");
+    {
+        c8 tmp[12]; u8 n = 0; u32 v = size;
+        if(v == 0) tmp[n++] = '0';
+        else { while(v) { tmp[n++] = '0' + (u8)(v % 10); v /= 10; } }
+        while(n) g_ReqBuf[i++] = tmp[--n];
+    }
+    APPEND("\r\nContent-Type: application/octet-stream\r\n");
+    if(forceOverwrite) APPEND("If-Match: *\r\n");
+    APPEND("User-Agent: NT/" NT_VERSION "\r\nConnection: close\r\n\r\n");
+    #undef APPEND
+    return i;
+}
+
+//─────────────────────────────────────────────────────────────────
 // Conversion nombre largo -> "8.3" en mayusculas para FCB / handle
 // (truncado conservador para que quepa siempre)
 //─────────────────────────────────────────────────────────────────
@@ -606,6 +670,10 @@ static void Ui_DrawFrame(void)
     Scr_Cls();
     Scr_Locate(0, 0);
     Scr_PutStr("NT v" NT_VERSION " - Net Transfer browser");
+
+    Scr_Locate(34, 0);
+    Scr_PutStr(g_ViewMode == VIEW_LOCAL ? "[LOCAL] " : "[SERVER]");
+
     Scr_Locate(50, 0);
     Scr_PutStr("Server: ");
     Scr_PutIP(g_Ip);
@@ -616,7 +684,11 @@ static void Ui_DrawFrame(void)
     Scr_HLine(21, '-');
 
     Scr_Locate(0, 22);
-    Scr_PutStr("Arrows: navigate   ENTER: download   R: refresh   ESC: exit");
+    if(g_ViewMode == VIEW_LOCAL) {
+        Scr_PutStr("Arrows nav  ENTER upload   L/S local/server   ESC exit");
+    } else {
+        Scr_PutStr("Arrows nav  ENTER download   L/S local/server   R refresh   ESC exit");
+    }
 }
 
 // Calcula (x,y) en pantalla del item idx, segun layout 2-columnas
@@ -831,6 +903,183 @@ static bool DownloadSelected(void)
     return ok;
 }
 
+// Forward decl — WaitKeyRelease se define mas abajo pero UploadSelected lo usa.
+static void WaitKeyRelease(void);
+
+//─────────────────────────────────────────────────────────────────
+// Sube un fichero local al servidor con PUT. Devuelve el status HTTP
+// (200, 201, 409, etc.) en exito, o codigos especiales:
+//   0 = no se pudo abrir el fichero local
+//   1 = error de red
+//   2 = abortado por el usuario (ESC durante la subida)
+//─────────────────────────────────────────────────────────────────
+static u16 DoUpload(const c8* localName, bool forceOverwrite)
+{
+    DOS_FIB* fib;
+    u8  fh;
+    u32 fileSize, sent;
+    NetConn conn;
+    u16 reqLen;
+
+    fib = DOS_FindFirstEntry(localName, 0);
+    if(fib == 0) return 0;
+    fileSize = fib->Size;
+
+    fh = DOS_OpenHandle(localName, O_RDONLY);
+    if(fh == 0xFF) return 0;
+
+    conn = Net_Open(g_Ip, NT_PORT);
+    if(conn == NET_INVALID_CONN) { DOS_CloseHandle(fh); return 1; }
+
+    {
+        u16 idle = 0;
+        while(!Net_IsConnected(conn)) {
+            if(++idle > IDLE_LIMIT) {
+                Net_Abort(conn); DOS_CloseHandle(fh); return 1;
+            }
+        }
+    }
+
+    reqLen = BuildPutRequest(localName, fileSize, forceOverwrite);
+    if(!Net_Send(conn, (const u8*)g_ReqBuf, reqLen)) {
+        Net_Abort(conn); DOS_CloseHandle(fh); return 1;
+    }
+
+    // Prefijo del progreso (anchura fija para evitar parpadeo)
+    Ui_StatusClear();
+    Scr_Locate(0, STATUS_ROW);
+    Scr_PutStr("Uploading ");
+    Scr_PutStr(localName);
+    Scr_PutStr("...  ");
+    Scr_Locate(30, STATUS_ROW);
+    Scr_PutStr("        ");
+    Scr_Locate(38, STATUS_ROW);
+    Scr_PutStr(" / ");
+    Scr_PutU32_8(fileSize);
+    Scr_PutStr(" B");
+
+    sent = 0;
+    while(sent < fileSize) {
+        u16 want, got;
+        u8  row7;
+        want = (fileSize - sent > RX_BUF_SIZE) ? RX_BUF_SIZE : (u16)(fileSize - sent);
+        got  = DOS_ReadHandle(fh, g_RxBuf, want);
+        if(got == 0) { Net_Abort(conn); DOS_CloseHandle(fh); return 1; }
+        if(!Net_Send(conn, g_RxBuf, got)) {
+            Net_Abort(conn); DOS_CloseHandle(fh); return 1;
+        }
+        sent += got;
+
+        // Actualiza solo los 8 digitos del contador en col 30
+        Scr_Locate(30, STATUS_ROW);
+        Scr_PutU32_8(sent);
+
+        // ESC abort
+        row7 = My_Snsmat(7);
+        if(IS_KEY_PRESSED(row7, KEY_ESC)) {
+            Net_Abort(conn); DOS_CloseHandle(fh); return 2;
+        }
+    }
+    DOS_CloseHandle(fh);
+
+    // Lee respuesta — esperamos cabeceras + opcional body corto
+    g_HdrLen     = 0;
+    g_StatusCode = 0;
+    {
+        bool hdrDone = FALSE;
+        u16  idle = 0;
+        while(!hdrDone) {
+            u16 avail = Net_Available(conn);
+            if(avail == 0) {
+                if(!Net_IsConnected(conn)) break;
+                if(++idle > IDLE_LIMIT) break;
+                continue;
+            }
+            idle = 0;
+            {
+                u16 take = (avail > RX_BUF_SIZE) ? RX_BUF_SIZE : avail;
+                u16 got  = Net_Recv(conn, g_RxBuf, take);
+                u16 bodyOff, bodyN;
+                if(got == 0) break;
+                hdrDone = AppendHeader(g_RxBuf, got, &bodyOff, &bodyN);
+                if(hdrDone) { ParseHeaders(); break; }
+                if(g_HdrLen >= HDR_BUF_SIZE) break;
+            }
+        }
+    }
+    Net_Close(conn);
+
+    return g_StatusCode == 0 ? 1 : g_StatusCode;
+}
+
+//─────────────────────────────────────────────────────────────────
+// Despues de subir, muestra el resultado y pregunta si hay 409 si
+// se quiere sobreescribir (O) o cancelar (C). Devuelve TRUE si quedo
+// finalmente OK (200/201), FALSE si fallo o se cancelo.
+//─────────────────────────────────────────────────────────────────
+static bool UploadSelected(void)
+{
+    const c8* name = g_Files[g_Selection].name;
+    u16 status;
+
+    status = DoUpload(name, FALSE);
+
+    if(status == 200 || status == 201) {
+        Ui_StatusClear();
+        Scr_Locate(0, STATUS_ROW);
+        Scr_PutStr("Upload OK ");
+        Scr_PutStr(name);
+        return TRUE;
+    }
+
+    if(status == 0) { Ui_Status("ERROR: cannot open local file"); return FALSE; }
+    if(status == 1) { Ui_Status("ERROR: network failure");        return FALSE; }
+    if(status == 2) { Ui_Status("Upload aborted");                return FALSE; }
+
+    if(status == 409) {
+        // Conflicto — preguntar al usuario
+        Ui_StatusClear();
+        Scr_Locate(0, STATUS_ROW);
+        Scr_PutStr("File exists. (O)verwrite  (C)ancel ?");
+        WaitKeyRelease();
+        while(1) {
+            u8 row3 = My_Snsmat(3);   // KEY_C
+            u8 row4 = My_Snsmat(4);   // KEY_O
+            u8 row7 = My_Snsmat(7);   // KEY_ESC
+            if(IS_KEY_PRESSED(row4, KEY_O)) {
+                WaitKeyRelease();
+                status = DoUpload(name, TRUE);
+                if(status == 200 || status == 201) {
+                    Ui_StatusClear();
+                    Scr_Locate(0, STATUS_ROW);
+                    Scr_PutStr("Upload OK (overwrite) ");
+                    Scr_PutStr(name);
+                    return TRUE;
+                }
+                Ui_StatusClear();
+                Scr_Locate(0, STATUS_ROW);
+                Scr_PutStr("ERROR: overwrite failed (status=");
+                Scr_PutU32((u32)status);
+                Scr_PutStr(")");
+                return FALSE;
+            }
+            if(IS_KEY_PRESSED(row3, KEY_C) || IS_KEY_PRESSED(row7, KEY_ESC)) {
+                WaitKeyRelease();
+                Ui_Status("Upload cancelled");
+                return FALSE;
+            }
+        }
+    }
+
+    // Otros codigos
+    Ui_StatusClear();
+    Scr_Locate(0, STATUS_ROW);
+    Scr_PutStr("ERROR: upload failed (status=");
+    Scr_PutU32((u32)status);
+    Scr_PutStr(")");
+    return FALSE;
+}
+
 //─────────────────────────────────────────────────────────────────
 // Espera a que se suelten todas las teclas (antiboucing)
 //─────────────────────────────────────────────────────────────────
@@ -882,7 +1131,8 @@ static void Browse(void)
     Ui_DrawList();
 
     while(1) {
-        u8 row4 = My_Snsmat(4);     // contiene KEY_R (row 4 bit 7)
+        u8 row4 = My_Snsmat(4);     // contiene KEY_R, KEY_L
+        u8 row5 = My_Snsmat(5);     // contiene KEY_S
         u8 row7 = My_Snsmat(7);
         u8 row8 = My_Snsmat(8);
 
@@ -892,27 +1142,64 @@ static void Browse(void)
             return;
         }
 
-        // ── R: refrescar listado (carpeta del servidor pudo cambiar) ──
+        // ── L: cambiar a vista LOCAL ──
+        if(IS_KEY_PRESSED(row4, KEY_L) && g_ViewMode != VIEW_LOCAL) {
+            WaitKeyRelease();
+            g_ViewMode = VIEW_LOCAL;
+            LocalListFill();
+            Ui_DrawFrame();
+            Ui_DrawList();
+            continue;
+        }
+
+        // ── S: cambiar a vista SERVER ──
+        if(IS_KEY_PRESSED(row5, KEY_S) && g_ViewMode != VIEW_SERVER) {
+            WaitKeyRelease();
+            Ui_StatusClear();
+            Scr_Locate(0, STATUS_ROW);
+            Scr_PutStr("Loading server list...");
+            if(RefreshList()) {
+                g_ViewMode = VIEW_SERVER;
+                Ui_DrawFrame();
+                Ui_DrawList();
+            } else {
+                Ui_StatusClear();
+                Scr_Locate(0, STATUS_ROW);
+                Scr_PutStr("ERROR: cannot fetch server list");
+            }
+            continue;
+        }
+
+        // ── R: refrescar listado activo ──
         if(IS_KEY_PRESSED(row4, KEY_R)) {
             WaitKeyRelease();
             Ui_StatusClear();
             Scr_Locate(0, STATUS_ROW);
             Scr_PutStr("Refreshing...");
-            if(RefreshList()) {
+            if(g_ViewMode == VIEW_LOCAL) {
+                LocalListFill();
                 Ui_DrawList();
             } else {
-                Ui_StatusClear();
-                Scr_Locate(0, STATUS_ROW);
-                Scr_PutStr("ERROR: refresh failed");
+                if(RefreshList()) {
+                    Ui_DrawList();
+                } else {
+                    Ui_StatusClear();
+                    Scr_Locate(0, STATUS_ROW);
+                    Scr_PutStr("ERROR: refresh failed");
+                }
             }
             continue;
         }
 
-        // ── ENTER: descargar ──
+        // ── ENTER: descargar (SERVER) o subir (LOCAL) ──
         if(IS_KEY_PRESSED(row7, KEY_RETURN)) {
             if(g_FileCount > 0) {
                 WaitKeyRelease();
-                DownloadSelected();
+                if(g_ViewMode == VIEW_SERVER) {
+                    DownloadSelected();
+                } else {
+                    UploadSelected();
+                }
                 // Espera tecla para acknowledge (sin redibujar la lista al volver)
                 Scr_Locate(60, STATUS_ROW);
                 Scr_PutStr("  (press a key)");
@@ -1012,6 +1299,7 @@ void main(void)
     g_FileCount      = 0;
     g_Selection      = 0;
     g_ScrollTop      = 0;
+    g_ViewMode       = VIEW_SERVER;   // empezamos viendo el servidor
     g_ListLen        = 0;
     g_HdrLen         = 0;
     g_StatusCode     = 0;

@@ -229,10 +229,12 @@ impl Drop for Server {
 // Detector de IPs locales (sin dependencias)
 //─────────────────────────────────────────────────────────────────
 
+/// Devuelve LA IP local que el SO usaria para llegar a Internet (truco UDP
+/// connect a 8.8.8.8). Es la que realmente esta en la LAN — no devolvemos
+/// las de Docker/WSL/VirtualBox/Hyper-V que aparecen por hostname lookup y
+/// confunden al usuario (no son alcanzables desde el MSX real).
 pub fn local_ipv4s() -> Vec<Ipv4Addr> {
     let mut out: Vec<Ipv4Addr> = Vec::new();
-
-    // 1. La saliente — UDP socket "connect" a 8.8.8.8 sin enviar datos.
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
             if let Ok(SocketAddr::V4(addr)) = sock.local_addr() {
@@ -243,44 +245,7 @@ pub fn local_ipv4s() -> Vec<Ipv4Addr> {
             }
         }
     }
-
-    // 2. Todas las del host por hostname lookup.
-    if let Ok(hostname) = hostname_lookup() {
-        if let Ok(iter) = (hostname.as_str(), 0u16).to_socket_addrs_safe() {
-            for sa in iter {
-                if let SocketAddr::V4(a) = sa {
-                    let ip = *a.ip();
-                    if !ip.is_unspecified() && !ip.is_loopback() && !out.contains(&ip) {
-                        out.push(ip);
-                    }
-                }
-            }
-        }
-    }
-
     out
-}
-
-fn hostname_lookup() -> std::io::Result<String> {
-    if let Ok(h) = std::env::var("COMPUTERNAME") {
-        return Ok(h);
-    }
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        return Ok(h);
-    }
-    fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
-}
-
-trait ToSocketAddrsSafe {
-    fn to_socket_addrs_safe(self) -> std::io::Result<std::vec::IntoIter<SocketAddr>>;
-}
-
-impl ToSocketAddrsSafe for (&str, u16) {
-    fn to_socket_addrs_safe(self) -> std::io::Result<std::vec::IntoIter<SocketAddr>> {
-        use std::net::ToSocketAddrs;
-        let v: Vec<SocketAddr> = self.to_socket_addrs()?.collect();
-        Ok(v.into_iter())
-    }
 }
 
 //─────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 [package]
 name = "nettransfer-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Antxiko Gorjon <antxiko@gmail.com>"]
 description = "Server side of MSX Net Transfer — share files from your PC to a real MSX over the network"
