@@ -38,6 +38,11 @@
 #define HDR_BUF_SIZE     512
 #define IDLE_LIMIT       20000
 
+#define FILTER_ALL       0
+#define FILTER_ROM       1
+#define FILTER_DSK       2
+#define FILTER_COUNT     3
+
 //─────────────────────────────────────────────────────────────────
 // Estado global
 //─────────────────────────────────────────────────────────────────
@@ -72,6 +77,10 @@ static u32 g_ContentLen;
 static bool g_HaveContentLen;
 
 static c8  g_CmdLine[129];
+
+static u8  g_FilterMode;
+static u8  g_FilteredIdx[MAX_FILES];
+static u8  g_FilteredCount;
 
 // Traza interna de diagnostico: sin uso en release. Si en algun debug futuro
 // hace falta inspeccionar el flujo de HttpFetch, definir ENABLE_TRACE=1 y
@@ -559,9 +568,7 @@ static bool RefreshList(void)
     g_HdrLen        = 0;
     if(!HttpFetch("/_list", &sink)) return FALSE;
     ParseList();
-    // Reset de cursor/scroll (puede haber cambiado el numero de ficheros)
-    g_Selection = 0;
-    g_ScrollTop = 0;
+    ApplyFilter();
     return TRUE;
 }
 
@@ -592,6 +599,7 @@ static bool LocalListFill(void)
         }
         fib = DOS_FindNextEntry();
     }
+    ApplyFilter();
     return TRUE;
 }
 
@@ -663,6 +671,49 @@ static void To83Upper(const c8* src, c8* dst)
 }
 
 //─────────────────────────────────────────────────────────────────
+// Filtrado de ficheros por extension
+//─────────────────────────────────────────────────────────────────
+static bool FileMatchesFilter(const c8* name)
+{
+    const c8* dot = 0;
+    const c8* p = name;
+    if(g_FilterMode == FILTER_ALL) return TRUE;
+    while(*p) { if(*p == '.') dot = p; p++; }
+    if(!dot) return FALSE;
+    dot++;
+    if(g_FilterMode == FILTER_ROM) {
+        return (LowerCaseAt(dot, 0) == 'r' &&
+                LowerCaseAt(dot, 1) == 'o' &&
+                LowerCaseAt(dot, 2) == 'm' &&
+                dot[3] == 0);
+    }
+    return (LowerCaseAt(dot, 0) == 'd' &&
+            LowerCaseAt(dot, 1) == 's' &&
+            LowerCaseAt(dot, 2) == 'k' &&
+            dot[3] == 0);
+}
+
+static void ApplyFilter(void)
+{
+    u8 i;
+    g_FilteredCount = 0;
+    for(i = 0; i < g_FileCount; i++) {
+        if(FileMatchesFilter(g_Files[i].name))
+            g_FilteredIdx[g_FilteredCount++] = i;
+    }
+    g_Selection = 0;
+    g_ScrollTop = 0;
+}
+
+static void Ui_DrawFilterLabel(void)
+{
+    Scr_Locate(43, 0);   // col 34 = [SERVER]/[LOCAL], col 43 = filter
+    if(g_FilterMode == FILTER_ROM)      Scr_PutStr("[ROM]");
+    else if(g_FilterMode == FILTER_DSK) Scr_PutStr("[DSK]");
+    else                                Scr_PutStr("[ALL]");
+}
+
+//─────────────────────────────────────────────────────────────────
 // Render de UI
 //─────────────────────────────────────────────────────────────────
 static void Ui_DrawFrame(void)
@@ -673,6 +724,7 @@ static void Ui_DrawFrame(void)
 
     Scr_Locate(34, 0);
     Scr_PutStr(g_ViewMode == VIEW_LOCAL ? "[LOCAL] " : "[SERVER]");
+    Ui_DrawFilterLabel();   // col 43
 
     Scr_Locate(50, 0);
     Scr_PutStr("Server: ");
@@ -685,9 +737,9 @@ static void Ui_DrawFrame(void)
 
     Scr_Locate(0, 22);
     if(g_ViewMode == VIEW_LOCAL) {
-        Scr_PutStr("Arrows nav  ENTER upload   L/S local/server   ESC exit");
+        Scr_PutStr("Arrows  ENTER upload   L/S view   R refresh   ESC exit");
     } else {
-        Scr_PutStr("Arrows nav  ENTER download   L/S local/server   R refresh   ESC exit");
+        Scr_PutStr("Arrows  ENTER download  L/S view  R refresh  F filter  ESC exit");
     }
 }
 
@@ -705,19 +757,20 @@ static void ItemPos(u8 idx, u8* outX, u8* outY)
 static void Ui_DrawListItem(u8 idx)
 {
     u8 x, y; u8 k;
+    FileEntry* fe = &g_Files[g_FilteredIdx[idx]];
     ItemPos(idx, &x, &y);
     Scr_Locate(x, y);
     // Cursor
     if(idx == g_Selection) Scr_PutChar('>'); else Scr_PutChar(' ');
     Scr_PutChar(' ');
     // Nombre, padding a NAME_VISIBLE
-    for(k = 0; k < NAME_VISIBLE && g_Files[idx].name[k]; k++) {
-        Scr_PutChar(g_Files[idx].name[k]);
+    for(k = 0; k < NAME_VISIBLE && fe->name[k]; k++) {
+        Scr_PutChar(fe->name[k]);
     }
     while(k < NAME_VISIBLE) { Scr_PutChar(' '); k++; }
     Scr_PutChar(' ');
     // Tamaño (8 chars derecha, sin sufijo — se sobreentiende que son bytes)
-    Scr_PutU32Right(g_Files[idx].size, 8);
+    Scr_PutU32Right(fe->size, 8);
     Scr_PutStr("    ");
 }
 
@@ -754,14 +807,14 @@ static void Ui_UpdateCounter(void)
     Scr_PutStr("File ");
     Scr_PutU16_3((u16)(g_Selection + 1));
     Scr_PutStr(" of ");
-    Scr_PutU16_3((u16)g_FileCount);
+    Scr_PutU16_3((u16)g_FilteredCount);
 }
 
 static void Ui_DrawList(void)
 {
     u8 i;
     u16 end16 = (u16)g_ScrollTop + (u16)LIST_VISIBLE;
-    u8 end = (end16 > (u16)g_FileCount) ? g_FileCount : (u8)end16;
+    u8 end = (end16 > (u16)g_FilteredCount) ? g_FilteredCount : (u8)end16;
 
     // Limpia las filas completas de pantalla (ambas columnas)
     for(i = LIST_TOP_ROW; i <= LIST_BOTTOM_ROW; i++) {
@@ -779,13 +832,13 @@ static void Ui_DrawList(void)
     // Contador
     Scr_Locate(0, STATUS_ROW);
     Scr_EraseEOL();
-    if(g_FileCount == 0) {
-        Scr_PutStr("(no files on server)");
+    if(g_FilteredCount == 0) {
+        Scr_PutStr(g_FileCount == 0 ? "(no files on server)" : "(no files match filter)");
     } else {
         Scr_PutStr("File ");
         Scr_PutU32((u32)(g_Selection + 1));
         Scr_PutStr(" of ");
-        Scr_PutU32((u32)g_FileCount);
+        Scr_PutU32((u32)g_FilteredCount);
     }
 }
 
@@ -843,7 +896,7 @@ static void DownloadProgress(u32 bytes, u32 total, bool haveTotal)
 //─────────────────────────────────────────────────────────────────
 static bool DownloadSelected(void)
 {
-    const c8* srcName = g_Files[g_Selection].name;
+    const c8* srcName = g_Files[g_FilteredIdx[g_Selection]].name;
     c8  dstName[16];
     c8  path[32];
     u8  file;
@@ -1043,7 +1096,7 @@ static u16 DoUpload(const c8* localName, bool forceOverwrite)
 //─────────────────────────────────────────────────────────────────
 static bool UploadSelected(void)
 {
-    const c8* name = g_Files[g_Selection].name;
+    const c8* name = g_Files[g_FilteredIdx[g_Selection]].name;
     u16 status;
 
     status = DoUpload(name, FALSE);
@@ -1170,8 +1223,9 @@ static void Browse(void)
     Ui_DrawList();
 
     while(1) {
-        u8 row4 = My_Snsmat(4);     // contiene KEY_R, KEY_L
-        u8 row5 = My_Snsmat(5);     // contiene KEY_S
+        u8 row3 = My_Snsmat(3);     // KEY_F (row 3 bit 3)
+        u8 row4 = My_Snsmat(4);     // KEY_R / KEY_L (row 4)
+        u8 row5 = My_Snsmat(5);     // KEY_S (row 5)
         u8 row7 = My_Snsmat(7);
         u8 row8 = My_Snsmat(8);
 
@@ -1230,9 +1284,19 @@ static void Browse(void)
             continue;
         }
 
+        // ── F: ciclar filtro ALL → ROM → DSK → ALL ──
+        if(IS_KEY_PRESSED(row3, KEY_F)) {
+            WaitKeyRelease();
+            g_FilterMode = (g_FilterMode + 1) % FILTER_COUNT;
+            ApplyFilter();
+            Ui_DrawFilterLabel();
+            Ui_DrawList();
+            continue;
+        }
+
         // ── ENTER: descargar (SERVER) o subir (LOCAL) ──
         if(IS_KEY_PRESSED(row7, KEY_RETURN)) {
-            if(g_FileCount > 0) {
+            if(g_FilteredCount > 0) {
                 WaitKeyRelease();
                 if(g_ViewMode == VIEW_SERVER) {
                     DownloadSelected();
@@ -1278,7 +1342,7 @@ static void Browse(void)
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_DOWN)) {
-            if(g_Selection + 1 < g_FileCount) {
+            if(g_Selection + 1 < g_FilteredCount) {
                 MoveSelection(g_Selection + 1);
                 { u16 d; for(d = 0; d < 4000; d++) ; }
             }
@@ -1295,7 +1359,7 @@ static void Browse(void)
         }
         if(IS_KEY_PRESSED(row8, KEY_RIGHT)) {
             u8 target = g_Selection + ROWS_PER_COL;
-            if(target < g_FileCount) {
+            if(target < g_FilteredCount) {
                 MoveSelection(target);
                 { u16 d; for(d = 0; d < 4000; d++) ; }
             }
@@ -1344,6 +1408,8 @@ void main(void)
     g_StatusCode     = 0;
     g_ContentLen     = 0;
     g_HaveContentLen = FALSE;
+    g_FilterMode    = FILTER_ALL;
+    g_FilteredCount = 0;
     #if ENABLE_TRACE
     g_TraceLen       = 0;
     #endif
@@ -1399,6 +1465,7 @@ void main(void)
     }
 
     ParseList();
+    ApplyFilter();
 
     // Ya estamos en 80 cols — entrar al navegador
     Browse();
