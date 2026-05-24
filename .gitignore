@@ -1,0 +1,43 @@
+# ── Rust (server) ─────────────────────────────────────────────────
+server/target/
+**/*.rs.bk
+
+# ── MSXgl client build artifacts (rebuilt by `bash build.sh`) ─────
+# Mantenemos client/nt.com (binary release-ready) en el repo, pero NO
+# los artifacts intermedios del build.
+client/out/
+client/build.log
+client/*.ihx
+client/*.lst
+client/*.map
+client/*.sym
+client/*.lk
+client/*.cdb
+client/*.adb
+client/*.asm
+client/*.s
+client/*.rel
+client/temp.dsk
+client/*.dsk
+
+# ── Disco de pruebas (no debe entrar en el repo — es grande y privado) ─
+test_disk/
+
+# ── Logs y archivos temporales ────────────────────────────────────
+*.log
+*.tmp
+*.bak
+unapinet_debug.log
+nthttp.log
+nthttp.err
+
+# ── Scripts/cosas locales ─────────────────────────────────────────
+run_test.ps1
+server/files/
+
+# ── Editor / IDE / SO ────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
