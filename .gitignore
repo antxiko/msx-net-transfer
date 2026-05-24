@@ -35,6 +35,9 @@ nthttp.err
 run_test.ps1
 server/files/
 
+# ── Release staging (artifacts descargados desde GitHub para releases manuales) ─
+release-staging/
+
 # ── Editor / IDE / SO ────────────────────────────────────────────
 .idea/
 .vscode/

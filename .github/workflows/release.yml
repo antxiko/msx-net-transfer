@@ -32,12 +32,16 @@ jobs:
             archive: tar.gz
             cli: nthttp
             gui: nthttp-gui
-          - os: macos-13
-            target: x86_64-apple-darwin
-            label: macos-x86_64
-            archive: tar.gz
-            cli: nthttp
-            gui: nthttp-gui
+          # NOTA: macos-13 (Intel Mac) runners en GitHub Actions tienen colas
+          # de espera muy largas (10-30+ min). Para usuarios de Mac Intel,
+          # el binario arm64 corre sin problema bajo Rosetta. Si en algun
+          # futuro release quieres binario nativo Intel, anade aqui:
+          #   - os: macos-13
+          #     target: x86_64-apple-darwin
+          #     label: macos-x86_64
+          #     archive: tar.gz
+          #     cli: nthttp
+          #     gui: nthttp-gui
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
