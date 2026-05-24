@@ -631,33 +631,33 @@ static void To83Upper(const c8* src, c8* dst)
 {
     u8 i, j;
     c8 base[9]; c8 ext[4];
-    const c8* dot = 0;
-    const c8* p = src;
-    while(*p) { if(*p == '.') dot = p; p++; }
+    u8 dotIdx = 0xFF;   // indice del ultimo punto, 0xFF si no hay ninguno
+    u8 k;
+    for(k = 0; src[k]; k++) { if(src[k] == '.') dotIdx = k; }
 
-    // base
-    for(i = 0, j = 0; j < 8 && src[i] && (&src[i] != dot); i++) {
+    // base: hasta el ultimo punto o max 8 caracteres
+    for(i = 0, j = 0; j < 8 && src[i] && (i != dotIdx); i++) {
         c8 c = src[i];
         if(c >= 'a' && c <= 'z') c = c - 32;
         if(c == ' ') continue;
         base[j++] = c;
     }
     base[j] = 0;
-    // ext
+    // ext: hasta 3 caracteres tras el punto
     ext[0] = 0;
-    if(dot) {
-        for(i = 0, j = 0; j < 3 && dot[1 + i]; i++) {
-            c8 c = dot[1 + i];
+    if(dotIdx != 0xFF) {
+        for(i = 0, j = 0; j < 3 && src[dotIdx + 1 + i]; i++) {
+            c8 c = src[dotIdx + 1 + i];
             if(c >= 'a' && c <= 'z') c = c - 32;
             ext[j++] = c;
         }
         ext[j] = 0;
     }
     // combinar
-    { u8 k; for(k = 0; base[k]; k++) *dst++ = base[k]; }
+    { u8 kk; for(kk = 0; base[kk]; kk++) *dst++ = base[kk]; }
     if(ext[0]) {
         *dst++ = '.';
-        { u8 k; for(k = 0; ext[k]; k++) *dst++ = ext[k]; }
+        { u8 kk; for(kk = 0; ext[kk]; kk++) *dst++ = ext[kk]; }
     }
     *dst = 0;
 }
