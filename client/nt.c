@@ -1099,6 +1099,21 @@ static void WaitKeyRelease(void)
     }
 }
 
+// Muestra "(press ENTER)" y espera a que el usuario lo pulse.
+// Usado antes de Scr_Restore() en paths de error para que el mensaje
+// no desaparezca al borrar la pantalla el cambio de modo BIOS.
+static void WaitEnter(void)
+{
+    u8 r7;
+    Scr_PutStr("(press ENTER)\r\n");
+    WaitKeyRelease();
+    while(1) {
+        r7 = My_Snsmat(7);
+        if(IS_KEY_PRESSED(r7, KEY_RETURN)) break;
+    }
+    WaitKeyRelease();
+}
+
 //─────────────────────────────────────────────────────────────────
 // Helpers de movimiento del cursor: cambian g_Selection y mantienen
 // g_ScrollTop alineado a ROWS_PER_COL (una columna entera a la vez).
@@ -1317,9 +1332,10 @@ void main(void)
     cursor = g_CmdLine;
     tok1 = NextToken(&cursor);
 
-    if(tok1 == 0) { PrintUsage(); Scr_Restore(); return; }
+    if(tok1 == 0) { PrintUsage(); WaitEnter(); Scr_Restore(); return; }
     if(!ParseIPv4(tok1, g_Ip)) {
         Scr_PutStr("ERROR: IP invalida\r\n");
+        WaitEnter();
         Scr_Restore();
         return;
     }
@@ -1327,6 +1343,7 @@ void main(void)
 
     if(!Net_Init()) {
         Scr_PutStr("ERROR: no UNAPI TCP/IP. Ejecuta UNAPINET antes.\r\n");
+        WaitEnter();
         Scr_Restore();
         return;
     }
@@ -1347,7 +1364,12 @@ void main(void)
 
     if(!listOk) {
         Scr_PutStr("\r\nERROR: no puedo descargar el listado del servidor.\r\n");
-        Scr_PutStr("Comprueba que el servidor NetTransfer este corriendo en ese IP.\r\n");
+        Scr_PutStr("  - HTTP status: ");
+        Scr_PutU32((u32)g_StatusCode);
+        Scr_PutStr("\r\n  - Comprueba IP, puerto ");
+        Scr_PutU32((u32)NT_PORT);
+        Scr_PutStr(" y que el servidor este corriendo.\r\n");
+        WaitEnter();
         Scr_Restore();
         return;
     }
