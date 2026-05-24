@@ -40,6 +40,18 @@ AppID        = "NH";
 Verbose          = true;
 CompileComplexity = "Default";
 
+// SDCC 4.2.0+ defaults to --sdcccall 1 (register-based args: HL/DE).
+// unapi_tcp.asm was written for --sdcccall 0 (stack-based args, SP+4/SP+6).
+//
+// We do NOT set CompileOpt = "--sdcccall 0" globally because that breaks calls
+// to z80.lib arithmetic helpers (__divsint, __mulint...) which are precompiled
+// for sdcccall 1 → wrong register/stack layout → crash on any integer division.
+//
+// Instead, client/network/unapi_tcp.h (a local shadow of the MSXgl original)
+// declares every tcpip_* function with __sdcccall(0), so only those call sites
+// use the stack-based convention. All other code stays on sdcccall 1.
+
+
 // Forzamos la RAM (codigo + datos) a empezar en $8000 (pagina 2). Asi nuestras
 // estructuras grandes (g_ListBuf, g_Files, g_RxBuf...) NO caen en pagina 1
 // ($4000-$7FFF), que es donde UNAPINET conmuta su mapper segment. Sin esto,
