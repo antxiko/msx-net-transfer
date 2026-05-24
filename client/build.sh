@@ -30,6 +30,10 @@ cp "$HERE/nt.c"        "$DST/"
 cp "$HERE/network.h"        "$DST/"
 cp "$HERE/msxgl_config.h"   "$DST/"
 cp "$HERE/project_config.js" "$DST/"
+# Copy local header overrides (shadows MSXgl's engine/src/network/unapi_tcp.h
+# with a version that adds __sdcccall(0) to all tcpip_* function declarations)
+mkdir -p "$DST/network"
+cp "$HERE/network/unapi_tcp.h" "$DST/network/"
 
 # build.sh dentro del proyecto MSXgl
 cat > "$DST/build.sh" <<'EOF'
