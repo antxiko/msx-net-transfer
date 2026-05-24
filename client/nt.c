@@ -859,6 +859,30 @@ static bool DownloadSelected(void)
 
     To83Upper(srcName, dstName);
 
+    // Si el fichero ya existe en el MSX, preguntar antes de sobreescribir.
+    {
+        u8 existing = DOS_OpenHandle(dstName, O_RDONLY);
+        if(existing != 0xFF) {
+            DOS_CloseHandle(existing);
+            Ui_Status("File exists! ENTER=overwrite  ESC=skip");
+            {
+                u8 r7;
+                while(1) {
+                    r7 = My_Snsmat(7);
+                    if(IS_KEY_PRESSED(r7, KEY_ESC)) {
+                        WaitKeyRelease();
+                        Ui_Status("Skipped.");
+                        return FALSE;
+                    }
+                    if(IS_KEY_PRESSED(r7, KEY_RETURN)) {
+                        WaitKeyRelease();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     file = DOS_CreateHandle(dstName, O_WRONLY, 0);
     if(file == 0xFF) {
         Ui_Status("ERROR: cannot create destination file");
