@@ -38,6 +38,11 @@ server/files/
 # ── Release staging (artifacts descargados desde GitHub para releases manuales) ─
 release-staging/
 
+# ── NestorWeb upstream clone (referencia local, no parte del repo) ────
+# Lo clonas tu solo con:  git clone https://github.com/Konamiman/NestorWeb \
+#                              server-msx/nestorweb-reference
+server-msx/nestorweb-reference/
+
 # ── Editor / IDE / SO ────────────────────────────────────────────
 .idea/
 .vscode/
