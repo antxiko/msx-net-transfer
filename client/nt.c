@@ -1,5 +1,5 @@
 //=============================================================================
-// nt.c — MSX Net Transfer 0.2.0 — cliente HTTP para MSX-DOS 2
+// nt.c — MSX Net Transfer 0.2.1 — cliente HTTP para MSX-DOS 2
 //
 // Uso:
 //     NT <ip>
@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.2.0"
+#define NT_VERSION       "0.2.1"
 #define NT_PORT          8088
 #define MAX_FILES        64
 #define NAME_LEN         28          // 27 + NUL

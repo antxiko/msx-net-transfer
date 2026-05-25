@@ -29,7 +29,9 @@ Net Transfer is a tiny client/server pair that lets your MSX browse a folder on 
 - **No protocol invention**: standard HTTP/1.0 — you can also browse the same folder from any web browser and `curl` works as a client too.
 - **Bidirectional**: download server → MSX (`GET`) and upload MSX → server (`PUT`), with optional resume (`Content-Range`).
 - **Dual-view MSX browser**: `S` shows the server's files, `L` shows the local MSX disk. `ENTER` downloads or uploads depending on the active view.
+- **Extension filter**: press `F` in either view to cycle through `[ALL] → [ROM] → [DSK] → [ALL]` — useful for picking the right artefact when you have hundreds of files on the server or on the MSX.
 - **Safe upload by default**: the server is read-only unless you explicitly enable uploads with `--writable` (CLI) or the *"Permitir uploads"* checkbox (GUI). Conflicting filenames return `409 Conflict` and the MSX prompts `(O)verwrite / (C)ancel`.
+- **Safe download by default**: when a download would overwrite an existing file on the MSX disk, the client prompts `ENTER` to overwrite or `ESC` to skip. Use the `/F` flag to bypass the prompt (force overwrite).
 - **Real binary transfer**: the server sends `Content-Length` and raw bytes; the MSX client streams straight to a file handle via MSX-DOS 2. The server writes uploads to a sidecar `.part` file and renames atomically on success.
 - **Tiny client**: `NT.COM` is around 8.5 KiB of compiled Z80 code (padded into a 32 KiB COM by MSXgl).
 - **Safe by default on paths**: the server rejects `..` path components, absolute paths, and anything that would escape the served folder. Uploads are restricted to direct children of the served folder (no subdirectories).
@@ -79,8 +81,11 @@ Copy `NT.COM` from the release onto any disk image or storage device your MSX ca
 From the MSX-DOS 2 prompt:
 
 ```
-A:\>UNAPINET            (or whatever loads your UNAPI TCP/IP stack)
-A:\>NT 192.168.0.102    (the IP shown by the server GUI)
+A:\>UNAPINET                    (or whatever loads your UNAPI TCP/IP stack)
+A:\>NT 192.168.0.102            (the IP shown by the server GUI)
+A:\>NT 192.168.0.102 /E:ROM     (start with the ROM-only extension filter active)
+A:\>NT 192.168.0.102 /E:DSK     (start with [DSK] filter)
+A:\>NT 192.168.0.102 /F         (force-overwrite on download, no prompt)
 ```
 
 The screen switches to 80-column mode and the file browser appears.
@@ -93,9 +98,11 @@ The screen switches to 80-column mode and the file browser appears.
 | ← / →                | Jump to previous / next column                                        |
 | `S`                  | Switch to **server** view (remote files; ENTER downloads)             |
 | `L`                  | Switch to **local** view (MSX disk files; ENTER uploads)              |
+| `F`                  | Cycle the extension filter: `[ALL]` → `[ROM]` → `[DSK]` → `[ALL]`     |
 | `ENTER`              | Download the highlighted file (server view) **or** upload it (local view) |
 | `R`                  | Refresh the current listing (server folder or local disk)             |
 | `O` / `C`            | On a 409 conflict during upload: `O` overwrite, `C` cancel            |
+| `ENTER` / `ESC`      | On a local-file overwrite prompt during download: `ENTER` overwrites, `ESC` skips |
 | `ESC`                | Cancel the in-flight upload, or quit and return to MSX-DOS prompt     |
 
 Filenames longer than 8.3 are converted to uppercase 8.3 when written to MSX disk on download — e.g. `dbg_startaddr.asc` is stored as `DBG_STAR.ASC`. Uploads send the local 8.3 name verbatim to the server.
