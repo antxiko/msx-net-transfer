@@ -29,6 +29,8 @@ Net Transfer is a tiny client/server pair that lets your MSX browse a folder on 
 - **No protocol invention**: standard HTTP/1.0 — you can also browse the same folder from any web browser and `curl` works as a client too.
 - **Bidirectional**: download server → MSX (`GET`) and upload MSX → server (`PUT`), with optional resume (`Content-Range`).
 - **Dual-view MSX browser**: `S` shows the server's files, `L` shows the local MSX disk. `ENTER` downloads or uploads depending on the active view.
+- **Unbounded folder size with pagination**: the server pages `/_list` in chunks of 256 (`?from=N&limit=N` query params + `X-Total-Count` header). The MSX client pages transparently when the cursor crosses the page boundary — a folder with 3000+ files is fully browsable, no hard cap.
+- **Cyclic navigation**: pressing `↑` / `←` on the first item of the first page wraps to the last item of the last page; `↓` / `→` on the last item wraps back to the start.
 - **Extension filter**: press `F` in either view to cycle through `[ALL] → [ROM] → [DSK] → [ALL]` — useful for picking the right artefact when you have hundreds of files on the server or on the MSX.
 - **Safe upload by default**: the server is read-only unless you explicitly enable uploads with `--writable` (CLI) or the *"Permitir uploads"* checkbox (GUI). Conflicting filenames return `409 Conflict` and the MSX prompts `(O)verwrite / (C)ancel`.
 - **Safe download by default**: when a download would overwrite an existing file on the MSX disk, the client prompts `ENTER` to overwrite or `ESC` to skip. Use the `/F` flag to bypass the prompt (force overwrite).

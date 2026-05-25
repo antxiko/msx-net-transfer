@@ -382,7 +382,19 @@ fn handle_get(
 
     // Endpoint especial maquina-friendly
     if decoded == "/_list" || decoded == "/_list/" {
-        let sent = serve_machine_list(stream, root, req.method == "HEAD")?;
+        // Paginacion: ?from=N&limit=N. Default: from=0, limit=256 (igual que
+        // el cap del cliente MSX). El cliente recibe X-Total-Count en la
+        // cabecera y puede pedir paginas siguientes.
+        let from = req
+            .query_param("from")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = req
+            .query_param("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(256);
+        let sent = serve_machine_list(stream, root, req.method == "HEAD", from, limit)?;
         return Ok(HandledRequest {
             method: req.method.clone(),
             path: req.path.clone(),
@@ -802,6 +814,20 @@ impl Request {
         }
     }
 
+    /// Devuelve el valor del query param `name` si esta en la URL. No decodifica
+    /// percent-encoding (los parametros que usamos son numericos).
+    fn query_param(&self, name: &str) -> Option<&str> {
+        let (_, query) = self.path.split_once('?')?;
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                if k == name {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
     }
@@ -1060,6 +1086,8 @@ fn serve_machine_list(
     stream: &mut TcpStream,
     root: &Path,
     head_only: bool,
+    from: usize,
+    limit: usize,
 ) -> std::io::Result<u64> {
     let mut entries: Vec<_> = fs::read_dir(root)?
         .filter_map(|e| e.ok())
@@ -1074,8 +1102,14 @@ fn serve_machine_list(
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let total = entries.len();
+
+    // Recorta a la ventana solicitada
+    let end = from.saturating_add(limit).min(total);
+    let window: &[_] = if from >= total { &[] } else { &entries[from..end] };
+
     let mut body = String::new();
-    for e in &entries {
+    for e in window {
         let n = e.file_name().to_string_lossy().to_string();
         let size = e.metadata().map(|m| m.len()).unwrap_or(0);
         if n.contains('\t') || n.contains('\n') || n.contains('\r') {
@@ -1089,8 +1123,12 @@ fn serve_machine_list(
         "HTTP/1.0 200 OK\r\n\
          Content-Type: text/plain; charset=ascii\r\n\
          Content-Length: {}\r\n\
+         X-Total-Count: {}\r\n\
+         X-Page-Start: {}\r\n\
          Connection: close\r\n\r\n",
-        body_bytes.len()
+        body_bytes.len(),
+        total,
+        from
     );
     stream.write_all(header.as_bytes())?;
     let mut sent = header.len() as u64;

@@ -1,5 +1,5 @@
 //=============================================================================
-// nt.c — MSX Net Transfer 0.2.1 — cliente HTTP para MSX-DOS 2
+// nt.c — MSX Net Transfer 0.2.2 — cliente HTTP para MSX-DOS 2
 //
 // Uso:
 //     NT <ip>
@@ -29,11 +29,11 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.2.1"
+#define NT_VERSION       "0.2.2"
 #define NT_PORT          8088
-#define MAX_FILES        64
+#define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
-#define LIST_BUF_SIZE    4096        // listado completo en RAM
+#define LIST_BUF_SIZE    8192        // pagina (~256 lineas) cabe holgada
 #define RX_BUF_SIZE      1024
 #define HDR_BUF_SIZE     512
 #define IDLE_LIMIT       20000
@@ -60,9 +60,9 @@ typedef struct {
 #define VIEW_LOCAL   1
 
 static FileEntry g_Files[MAX_FILES];
-static u8  g_FileCount;
-static u8  g_Selection;
-static u8  g_ScrollTop;
+static u16 g_FileCount;             // u16 — MAX_FILES=256 no cabe en u8
+static u16 g_Selection;
+static u16 g_ScrollTop;
 static u8  g_ViewMode;             // VIEW_SERVER / VIEW_LOCAL
 static c8  g_ListBuf[LIST_BUF_SIZE];
 static u16 g_ListLen;
@@ -79,8 +79,14 @@ static bool g_HaveContentLen;
 static c8  g_CmdLine[129];
 
 static u8  g_FilterMode;
-static u8  g_FilteredIdx[MAX_FILES];
-static u8  g_FilteredCount;
+static u16 g_FilteredIdx[MAX_FILES];   // ahora u16 — index puede ser hasta 255
+static u16 g_FilteredCount;
+
+// Paginacion — el cliente trabaja con paginas de MAX_FILES entradas y pide
+// la siguiente al servidor cuando el cursor cruza el limite. Asi soportamos
+// carpetas de cualquier tamaño que MSX-DOS pueda enumerar (3000+ ficheros).
+static u16 g_PageStart;            // offset en el listado completo
+static u16 g_TotalCount;           // total de ficheros en la carpeta
 
 // Traza interna de diagnostico: sin uso en release. Si en algun debug futuro
 // hace falta inspeccionar el flujo de HttpFetch, definir ENABLE_TRACE=1 y
@@ -361,6 +367,12 @@ static bool ParseHeaders(void)
             g_ContentLen = ParseU32(&g_HdrBuf[j]);
             g_HaveContentLen = TRUE;
         }
+        // X-Total-Count: <N>  — total de ficheros en la carpeta (paginacion)
+        else if(StartsWithI(&g_HdrBuf[line_start], "x-total-count:")) {
+            u16 j = line_start + 14;
+            while(j < i && (g_HdrBuf[j] == ' ' || g_HdrBuf[j] == '\t')) j++;
+            g_TotalCount = (u16)ParseU32(&g_HdrBuf[j]);
+        }
         line_start = i + 1;
     }
     return (g_StatusCode == 200);
@@ -554,8 +566,41 @@ static void ParseList(void)
     }
 }
 
+// Forward decls — funciones definidas mas abajo pero usadas aqui:
+static void ApplyFilter(void);
+static void WaitKeyRelease(void);
+
 //─────────────────────────────────────────────────────────────────
-// Descarga /_list del servidor y rellena g_Files[]. Devuelve TRUE si OK.
+// Construye la URL de listado paginado /_list?from=N&limit=M
+// (con limite = MAX_FILES). El buffer es estatico para evitar reservas.
+//─────────────────────────────────────────────────────────────────
+static c8 g_ListUrl[40];
+static const c8* BuildListUrl(void)
+{
+    u8 i = 0;
+    const c8* s = "/_list?from=";
+    while(*s) g_ListUrl[i++] = *s++;
+    {
+        c8 tmp[6]; u8 n = 0; u16 v = g_PageStart;
+        if(v == 0) tmp[n++] = '0';
+        else { while(v) { tmp[n++] = '0' + (u8)(v % 10); v /= 10; } }
+        while(n) g_ListUrl[i++] = tmp[--n];
+    }
+    s = "&limit=";
+    while(*s) g_ListUrl[i++] = *s++;
+    {
+        c8 tmp[6]; u8 n = 0; u16 v = MAX_FILES;
+        while(v) { tmp[n++] = '0' + (u8)(v % 10); v /= 10; }
+        while(n) g_ListUrl[i++] = tmp[--n];
+    }
+    g_ListUrl[i] = 0;
+    return g_ListUrl;
+}
+
+//─────────────────────────────────────────────────────────────────
+// Descarga UNA PAGINA del listado del servidor. La pagina viene
+// determinada por g_PageStart (que el caller actualiza antes de llamar).
+// Devuelve TRUE si OK. Setea g_TotalCount con el X-Total-Count del header.
 //─────────────────────────────────────────────────────────────────
 static bool RefreshList(void)
 {
@@ -566,7 +611,8 @@ static bool RefreshList(void)
     sink.progress   = 0;
     g_StatusCode    = 0;
     g_HdrLen        = 0;
-    if(!HttpFetch("/_list", &sink)) return FALSE;
+    g_TotalCount    = 0;
+    if(!HttpFetch(BuildListUrl(), &sink)) return FALSE;
     ParseList();
     ApplyFilter();
     return TRUE;
@@ -574,31 +620,37 @@ static bool RefreshList(void)
 
 //─────────────────────────────────────────────────────────────────
 // Enumera los ficheros del directorio actual de MSX-DOS 2 con FFIRST/FNEXT
-// y rellena g_Files[]. Usado por la vista LOCAL para elegir que subir.
+// y rellena g_Files[]. Pagina segun g_PageStart (salta primeras N entradas)
+// y rellena hasta MAX_FILES. Calcula tambien g_TotalCount (cuenta total
+// para mostrar "page X/Y of N" en el status).
 //─────────────────────────────────────────────────────────────────
 static bool LocalListFill(void)
 {
     DOS_FIB* fib;
+    u16 seen = 0;            // ficheros validos vistos en el barrido
     g_FileCount = 0;
-    g_Selection = 0;
-    g_ScrollTop = 0;
 
     fib = DOS_FindFirstEntry("*.*", 0);
-    while(fib && g_FileCount < MAX_FILES) {
-        // Saltar subdirectorios y entradas raras
+    while(fib) {
+        // Saltar subdirectorios / devices — no entran en el listado
         if((fib->Attribute & ATTR_FOLDER) == 0 &&
            (fib->Attribute & ATTR_DEVICE) == 0)
         {
-            u8 k;
-            for(k = 0; k < NAME_LEN - 1 && fib->Filename[k]; k++) {
-                g_Files[g_FileCount].name[k] = fib->Filename[k];
+            // Si caemos dentro de la ventana [g_PageStart, g_PageStart+MAX_FILES) lo guardamos.
+            if(seen >= g_PageStart && g_FileCount < MAX_FILES) {
+                u8 k;
+                for(k = 0; k < NAME_LEN - 1 && fib->Filename[k]; k++) {
+                    g_Files[g_FileCount].name[k] = fib->Filename[k];
+                }
+                g_Files[g_FileCount].name[k] = 0;
+                g_Files[g_FileCount].size = fib->Size;
+                g_FileCount++;
             }
-            g_Files[g_FileCount].name[k] = 0;
-            g_Files[g_FileCount].size = fib->Size;
-            g_FileCount++;
+            seen++;
         }
         fib = DOS_FindNextEntry();
     }
+    g_TotalCount = seen;     // total real de la carpeta
     ApplyFilter();
     return TRUE;
 }
@@ -695,7 +747,7 @@ static bool FileMatchesFilter(const c8* name)
 
 static void ApplyFilter(void)
 {
-    u8 i;
+    u16 i;
     g_FilteredCount = 0;
     for(i = 0; i < g_FileCount; i++) {
         if(FileMatchesFilter(g_Files[i].name))
@@ -745,16 +797,18 @@ static void Ui_DrawFrame(void)
 
 // Calcula (x,y) en pantalla del item idx, segun layout 2-columnas
 // (newspaper-style: idx 0..ROWS_PER_COL-1 en col izquierda, etc.).
-static void ItemPos(u8 idx, u8* outX, u8* outY)
+// Idx es u16 (g_Selection ahora es u16) pero dentro de una pagina el rel
+// siempre cabe en u8 porque LIST_VISIBLE = 36.
+static void ItemPos(u16 idx, u8* outX, u8* outY)
 {
-    u8 rel = idx - g_ScrollTop;
+    u8 rel = (u8)(idx - g_ScrollTop);
     u8 col = rel / ROWS_PER_COL;
     u8 row = rel % ROWS_PER_COL;
     *outX = col * COL_WIDTH;
     *outY = LIST_TOP_ROW + row;
 }
 
-static void Ui_DrawListItem(u8 idx)
+static void Ui_DrawListItem(u16 idx)
 {
     u8 x, y; u8 k;
     FileEntry* fe = &g_Files[g_FilteredIdx[idx]];
@@ -776,7 +830,7 @@ static void Ui_DrawListItem(u8 idx)
 
 // Actualiza SOLO el caracter de cursor de un item (sin redibujar el resto).
 // Evita parpadeo al mover la seleccion.
-static void Ui_DrawCursorAt(u8 idx, bool selected)
+static void Ui_DrawCursorAt(u16 idx, bool selected)
 {
     u8 x, y;
     ItemPos(idx, &x, &y);
@@ -799,22 +853,36 @@ static void Scr_PutU16_3(u16 v)
     Scr_PutChar(d2);
 }
 
-// Reescribe SOLO el contador "File NNN of NNN" en la barra de status sin
-// borrar la linea entera (anchura fija = no parpadeo).
+// Reescribe el status: "file N/M  total T" + indicador de pagina si hay
+// mas de una. Sin EraseEOL para evitar parpadeo (la linea siempre tiene
+// la misma estructura, los digitos se sobreescriben encima).
 static void Ui_UpdateCounter(void)
 {
+    // Numero absoluto del fichero seleccionado en la carpeta entera
+    u16 absSel = g_PageStart + g_Selection + 1;
+
     Scr_Locate(0, STATUS_ROW);
+    Scr_EraseEOL();
     Scr_PutStr("File ");
-    Scr_PutU16_3((u16)(g_Selection + 1));
+    Scr_PutU32((u32)absSel);
     Scr_PutStr(" of ");
-    Scr_PutU16_3((u16)g_FilteredCount);
+    Scr_PutU32((u32)g_TotalCount);
+    // Indicador de pagina si hay mas de una
+    if(g_TotalCount > MAX_FILES) {
+        u16 page = (g_PageStart / MAX_FILES) + 1;
+        u16 pages = (g_TotalCount + MAX_FILES - 1) / MAX_FILES;
+        Scr_PutStr("   page ");
+        Scr_PutU32((u32)page);
+        Scr_PutChar('/');
+        Scr_PutU32((u32)pages);
+    }
 }
 
 static void Ui_DrawList(void)
 {
-    u8 i;
-    u16 end16 = (u16)g_ScrollTop + (u16)LIST_VISIBLE;
-    u8 end = (end16 > (u16)g_FilteredCount) ? g_FilteredCount : (u8)end16;
+    u16 i;
+    u16 end16 = g_ScrollTop + (u16)LIST_VISIBLE;
+    u16 end = (end16 > g_FilteredCount) ? g_FilteredCount : end16;
 
     // Limpia las filas completas de pantalla (ambas columnas)
     for(i = LIST_TOP_ROW; i <= LIST_BOTTOM_ROW; i++) {
@@ -829,16 +897,13 @@ static void Ui_DrawList(void)
     Scr_EraseEOL();
     Scr_PutStr("  FILE                  SIZE             FILE                  SIZE");
 
-    // Contador
-    Scr_Locate(0, STATUS_ROW);
-    Scr_EraseEOL();
+    // Contador (delega en Ui_UpdateCounter para la version paginada)
     if(g_FilteredCount == 0) {
-        Scr_PutStr(g_FileCount == 0 ? "(no files on server)" : "(no files match filter)");
+        Scr_Locate(0, STATUS_ROW);
+        Scr_EraseEOL();
+        Scr_PutStr(g_FileCount == 0 ? "(folder empty)" : "(no files match filter)");
     } else {
-        Scr_PutStr("File ");
-        Scr_PutU32((u32)(g_Selection + 1));
-        Scr_PutStr(" of ");
-        Scr_PutU32((u32)g_FilteredCount);
+        Ui_UpdateCounter();
     }
 }
 
@@ -1195,23 +1260,56 @@ static void WaitEnter(void)
 // Helpers de movimiento del cursor: cambian g_Selection y mantienen
 // g_ScrollTop alineado a ROWS_PER_COL (una columna entera a la vez).
 //─────────────────────────────────────────────────────────────────
-static void MoveSelection(u8 newSel)
+static void MoveSelection(u16 newSel)
 {
-    u8 prev = g_Selection;
+    u16 prev = g_Selection;
     g_Selection = newSel;
 
     if(g_Selection < g_ScrollTop) {
         // scroll back por columnas hasta cubrir la nueva seleccion
         while(g_Selection < g_ScrollTop) g_ScrollTop -= ROWS_PER_COL;
         Ui_DrawList();
-    } else if(g_Selection >= (u8)(g_ScrollTop + LIST_VISIBLE)) {
-        while(g_Selection >= (u8)(g_ScrollTop + LIST_VISIBLE)) g_ScrollTop += ROWS_PER_COL;
+    } else if(g_Selection >= (g_ScrollTop + LIST_VISIBLE)) {
+        while(g_Selection >= (g_ScrollTop + LIST_VISIBLE)) g_ScrollTop += ROWS_PER_COL;
         Ui_DrawList();
     } else {
         Ui_DrawCursorAt(prev, FALSE);
         Ui_DrawCursorAt(g_Selection, TRUE);
         Ui_UpdateCounter();
     }
+}
+
+//─────────────────────────────────────────────────────────────────
+// Pagina al siguiente bloque de MAX_FILES ficheros. Direction +1/-1.
+// Si cursorAtEnd=TRUE, deja el cursor en el ultimo fichero de la pagina
+// nueva (util al subir de pagina con UP). Devuelve TRUE si pudo paginar.
+//─────────────────────────────────────────────────────────────────
+static bool LoadPage(u16 newPageStart, bool cursorAtEnd)
+{
+    u16 prevPageStart = g_PageStart;
+    g_PageStart = newPageStart;
+
+    bool ok;
+    if(g_ViewMode == VIEW_LOCAL) {
+        LocalListFill();
+        ok = TRUE;
+    } else {
+        ok = RefreshList();
+    }
+    if(!ok) {
+        g_PageStart = prevPageStart;
+        return FALSE;
+    }
+    // ApplyFilter ya hizo Selection=0, ScrollTop=0
+    if(cursorAtEnd && g_FilteredCount > 0) {
+        g_Selection = g_FilteredCount - 1;
+        // Aseguramos que el cursor sea visible
+        if(g_Selection >= LIST_VISIBLE) {
+            g_ScrollTop = ((g_Selection / ROWS_PER_COL) - (LIST_VISIBLE / ROWS_PER_COL) + 1) * ROWS_PER_COL;
+        }
+    }
+    Ui_DrawList();
+    return TRUE;
 }
 
 //─────────────────────────────────────────────────────────────────
@@ -1235,22 +1333,24 @@ static void Browse(void)
             return;
         }
 
-        // ── L: cambiar a vista LOCAL ──
+        // ── L: cambiar a vista LOCAL (vuelve a pagina 0) ──
         if(IS_KEY_PRESSED(row4, KEY_L) && g_ViewMode != VIEW_LOCAL) {
             WaitKeyRelease();
             g_ViewMode = VIEW_LOCAL;
+            g_PageStart = 0;
             LocalListFill();
             Ui_DrawFrame();
             Ui_DrawList();
             continue;
         }
 
-        // ── S: cambiar a vista SERVER ──
+        // ── S: cambiar a vista SERVER (vuelve a pagina 0) ──
         if(IS_KEY_PRESSED(row5, KEY_S) && g_ViewMode != VIEW_SERVER) {
             WaitKeyRelease();
             Ui_StatusClear();
             Scr_Locate(0, STATUS_ROW);
             Scr_PutStr("Loading server list...");
+            g_PageStart = 0;
             if(RefreshList()) {
                 g_ViewMode = VIEW_SERVER;
                 Ui_DrawFrame();
@@ -1333,36 +1433,68 @@ static void Browse(void)
             continue;
         }
 
-        // ── UP / DOWN ──
+        // ── UP / DOWN — paginan al cruzar tope; al rebasar las puntas
+        //                hacen wrap (cursor en primero -> ultimo absoluto, y al reves)
         if(IS_KEY_PRESSED(row8, KEY_UP)) {
             if(g_Selection > 0) {
                 MoveSelection(g_Selection - 1);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+            } else if(g_PageStart > 0) {
+                u16 newStart = (g_PageStart >= MAX_FILES) ? (g_PageStart - MAX_FILES) : 0;
+                LoadPage(newStart, TRUE);
+            } else if(g_TotalCount > MAX_FILES) {
+                // wrap: saltamos a la ultima pagina, cursor al final
+                u16 lastStart = ((g_TotalCount - 1) / MAX_FILES) * MAX_FILES;
+                LoadPage(lastStart, TRUE);
+            } else if(g_FilteredCount > 0) {
+                // wrap dentro de pagina unica
+                MoveSelection(g_FilteredCount - 1);
             }
+            { u16 d; for(d = 0; d < 4000; d++) ; }
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_DOWN)) {
             if(g_Selection + 1 < g_FilteredCount) {
                 MoveSelection(g_Selection + 1);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+            } else if(g_PageStart + g_FileCount < g_TotalCount) {
+                LoadPage(g_PageStart + MAX_FILES, FALSE);
+            } else if(g_PageStart > 0) {
+                // wrap: estamos en la ultima pagina -> volvemos a la primera
+                LoadPage(0, FALSE);
+            } else if(g_FilteredCount > 0) {
+                MoveSelection(0);
             }
+            { u16 d; for(d = 0; d < 4000; d++) ; }
             continue;
         }
 
-        // ── LEFT / RIGHT: saltar columna ──
+        // ── LEFT / RIGHT: saltar columna. Tambien paginan y hacen wrap igual ──
         if(IS_KEY_PRESSED(row8, KEY_LEFT)) {
             if(g_Selection >= ROWS_PER_COL) {
                 MoveSelection(g_Selection - ROWS_PER_COL);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+            } else if(g_PageStart > 0) {
+                u16 newStart = (g_PageStart >= MAX_FILES) ? (g_PageStart - MAX_FILES) : 0;
+                LoadPage(newStart, TRUE);
+            } else if(g_TotalCount > MAX_FILES) {
+                u16 lastStart = ((g_TotalCount - 1) / MAX_FILES) * MAX_FILES;
+                LoadPage(lastStart, TRUE);
+            } else if(g_FilteredCount > 0) {
+                MoveSelection(g_FilteredCount - 1);
             }
+            { u16 d; for(d = 0; d < 4000; d++) ; }
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_RIGHT)) {
-            u8 target = g_Selection + ROWS_PER_COL;
+            u16 target = g_Selection + ROWS_PER_COL;
             if(target < g_FilteredCount) {
                 MoveSelection(target);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+            } else if(g_PageStart + g_FileCount < g_TotalCount) {
+                LoadPage(g_PageStart + MAX_FILES, FALSE);
+            } else if(g_PageStart > 0) {
+                LoadPage(0, FALSE);
+            } else if(g_FilteredCount > 0) {
+                MoveSelection(0);
             }
+            { u16 d; for(d = 0; d < 4000; d++) ; }
             continue;
         }
     }
@@ -1402,6 +1534,8 @@ void main(void)
     g_FileCount      = 0;
     g_Selection      = 0;
     g_ScrollTop      = 0;
+    g_PageStart      = 0;
+    g_TotalCount     = 0;
     g_ViewMode       = VIEW_SERVER;   // empezamos viendo el servidor
     g_ListLen        = 0;
     g_HdrLen         = 0;
@@ -1444,14 +1578,10 @@ void main(void)
     Scr_PutU32((u32)NT_PORT);
     Scr_PutStr(" /_list ...\r\n");
 
-    sink.toFile     = FALSE;
-    sink.fileHandle = 0;
-    sink.written    = 0;
-    sink.progress   = 0;
-    g_StatusCode    = 0;
-    g_HdrLen        = 0;
-    listOk = HttpFetch("/_list", &sink);
-
+    // Carga primera pagina del listado del servidor (RefreshList construye
+    // la URL paginada /_list?from=0&limit=256 y rellena g_TotalCount).
+    listOk = RefreshList();
+    (void)sink;
     if(!listOk) {
         Scr_PutStr("\r\nERROR: no puedo descargar el listado del servidor.\r\n");
         Scr_PutStr("  - HTTP status: ");
@@ -1463,9 +1593,6 @@ void main(void)
         Scr_Restore();
         return;
     }
-
-    ParseList();
-    ApplyFilter();
 
     // Ya estamos en 80 cols — entrar al navegador
     Browse();
