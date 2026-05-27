@@ -1,14 +1,22 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.3.0-dev — HTTP server for MSX-DOS 2 (skeleton)
+// nts.c — MSX Net Transfer 0.2.3 — HTTP server for MSX-DOS 2
 //
-// SKELETON ONLY — the UI shell is wired up but the HTTP server isn't.
-// Toggling S / U / F / D / R updates the on-screen state; no TCP listener
-// is opened yet. The full implementation lands in the next iteration.
+// First implementation with HTTP: serves files from the current directory
+// over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
+// both speak to it. UI shell in SCREEN 0 80 columns, same look as NT.COM.
 //
-// Architecture and protocol are documented in server-msx/README.md.
+// Toggling S opens / closes the passive TCP listener. While SHARING is ON
+// the main loop polls the listener each iteration; when a client connects
+// the request is processed synchronously (UI is briefly unresponsive
+// during the actual transfer — acceptable for one-MSX-at-a-time service).
 //
-// Inspired by Konamiman's NestorWeb (especially the passive-listener and
-// LetTcpipBreathe patterns from tcpip.c) but no NestorWeb code is included.
+// Endpoints:
+//   GET /            -> tiny HTML index
+//   GET /_list[?from=N&limit=N]  -> name<TAB>size<LF>... + X-Total-Count header
+//   GET /<file>      -> file (Range: bytes=N- supported -> 206 Partial)
+//   PUT /<file>      -> only when U toggle is on; .part + atomic rename
+//
+// Inspired by Konamiman's NestorWeb (passive-listener pattern) — no code.
 //=============================================================================
 #include "msxgl.h"
 #include "dos.h"
@@ -18,11 +26,14 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.3.0-dev"
+#define NTS_VERSION      "0.2.3"
 #define NTS_PORT         8088
-#define MAX_FILES        64
+#define MAX_FILES        256         // pagina del /_list
 #define NAME_LEN         28
 #define IDLE_LIMIT       20000
+
+#define HTTP_HDR_MAX     1024        // header buffer (req + resp)
+#define HTTP_BODY_CHUNK  1024        // chunk de body en streams
 
 #define FILTER_ALL       0
 #define FILTER_ROM       1
@@ -38,13 +49,13 @@ typedef struct {
 } FileEntry;
 
 static FileEntry g_Files[MAX_FILES];
-static u8  g_FileCount;
-static u8  g_Selection;
-static u8  g_ScrollTop;
+static u16 g_FileCount;             // u16 — MAX_FILES=256 no cabe en u8
+static u16 g_Selection;
+static u16 g_ScrollTop;
 
 static u8  g_FilterMode;
-static u8  g_FilteredIdx[MAX_FILES];
-static u8  g_FilteredCount;
+static u16 g_FilteredIdx[MAX_FILES];
+static u16 g_FilteredCount;
 
 static u8  g_LocalIp[4];
 static bool g_NetReady;        // TRUE si UNAPI esta cargada y hay IP
@@ -52,6 +63,19 @@ static bool g_NetReady;        // TRUE si UNAPI esta cargada y hay IP
 static bool g_SharingOn;       // toggle S — TCP listener active
 static bool g_UploadsOn;       // toggle U — PUT allowed
 static u32 g_RequestCount;     // peticiones servidas desde arranque
+
+// ── HTTP server state ──
+static NetConn g_Listener = NET_INVALID_CONN;
+static u8  g_HttpRxBuf[HTTP_BODY_CHUNK];   // recv scratch + disk read
+static c8  g_HttpHdrBuf[HTTP_HDR_MAX];     // request headers acumulados
+static u16 g_HttpHdrLen;
+static c8  g_HttpResp[HTTP_HDR_MAX];       // response header build
+static c8  g_HttpReqPath[80];              // path decodificado de la peticion
+static c8  g_HttpReqMethod[8];
+static u32 g_HttpReqContentLen;
+static bool g_HttpReqHasRange;
+static u32 g_HttpReqRangeStart;
+static bool g_HttpReqForceOverwrite;       // If-Match: *
 
 //─────────────────────────────────────────────────────────────────
 // Layout de pantalla — calcado del cliente
@@ -413,6 +437,627 @@ static void WaitKeyRelease(void)
     }
 }
 
+//═════════════════════════════════════════════════════════════════
+// HTTP server
+//═════════════════════════════════════════════════════════════════
+
+// ── helpers de envio ──
+static bool HttpSendStr(NetConn conn, const c8* s)
+{
+    u16 len = 0;
+    while(s[len]) len++;
+    return Net_Send(conn, (const u8*)s, len) == NET_OK;
+}
+
+static bool HttpSendU32(NetConn conn, u32 v)
+{
+    c8 tmp[12]; u8 n = 0;
+    if(v == 0) tmp[n++] = '0';
+    else { while(v) { tmp[n++] = '0' + (u8)(v % 10); v /= 10; } }
+    // tmp esta en orden inverso
+    c8 buf[12]; u8 i = 0;
+    while(n) buf[i++] = tmp[--n];
+    return Net_Send(conn, (const u8*)buf, i) == NET_OK;
+}
+
+// Util: decimal -> u32. Devuelve TRUE si parseo OK.
+static bool ParseU32Str(const c8* s, u32* out)
+{
+    u32 v = 0;
+    if(!*s) return FALSE;
+    while(*s >= '0' && *s <= '9') { v = v*10 + (u8)(*s - '0'); s++; }
+    *out = v;
+    return TRUE;
+}
+
+// URL decode in-place. Solo soporta %XX. Devuelve nueva longitud.
+static u8 UrlDecodeInPlace(c8* s)
+{
+    u8 i = 0, j = 0;
+    while(s[i]) {
+        c8 c = s[i++];
+        if(c == '%' && s[i] && s[i+1]) {
+            u8 hi = (s[i]   <= '9') ? s[i]   - '0' :
+                    (s[i]   <= 'F') ? s[i]   - 'A' + 10 :
+                                       s[i]   - 'a' + 10;
+            u8 lo = (s[i+1] <= '9') ? s[i+1] - '0' :
+                    (s[i+1] <= 'F') ? s[i+1] - 'A' + 10 :
+                                       s[i+1] - 'a' + 10;
+            s[j++] = (c8)((hi << 4) | lo);
+            i += 2;
+        } else {
+            s[j++] = c;
+        }
+    }
+    s[j] = 0;
+    return j;
+}
+
+// Path validation para PUT y GET. El nombre debe ser un solo componente,
+// sin '/', '\', "..", y no empezar con '.'. Si OK escribe el nombre en
+// nameOut (max 16 chars 8.3 con NUL) y devuelve TRUE.
+static bool SafeFilename(const c8* path, c8* nameOut)
+{
+    const c8* p = path;
+    u8 k = 0;
+    if(*p == '/') p++;
+    if(!*p) return FALSE;
+    while(*p) {
+        c8 c = *p++;
+        if(c == '/' || c == '\\') return FALSE;
+        if(c == '.' && k == 0) return FALSE;   // no leading dot
+        if(k >= 15) return FALSE;              // 12 + reserva
+        nameOut[k++] = c;
+    }
+    nameOut[k] = 0;
+    // Rechazar ".."
+    if(nameOut[0] == '.' && nameOut[1] == '.' && nameOut[2] == 0) return FALSE;
+    return TRUE;
+}
+
+// Compara prefijo case-insensitive
+static bool StartsWithI(const c8* h, const c8* prefix)
+{
+    while(*prefix) {
+        c8 a = *h; c8 b = *prefix;
+        if(a >= 'A' && a <= 'Z') a += 32;
+        if(b >= 'A' && b <= 'Z') b += 32;
+        if(a != b) return FALSE;
+        h++; prefix++;
+    }
+    return TRUE;
+}
+
+// ── leer headers ──
+// Acumula bytes del socket en g_HttpHdrBuf hasta encontrar \r\n\r\n,
+// o hasta timeout / overflow.
+// CRITICO: leemos byte a byte para no consumir bytes del body que pudieran
+// venir en el mismo TCP packet. Si chupasemos un chunk grande, los bytes
+// despues de \r\n\r\n se perderian — esto rompia PUT con bodies pequenos.
+static bool HttpReadHeaders(NetConn conn)
+{
+    u16 idle = 0;
+    g_HttpHdrLen = 0;
+    while(1) {
+        u16 avail = Net_Available(conn);
+        if(avail == 0) {
+            if(!Net_IsConnected(conn)) return FALSE;
+            if(++idle > IDLE_LIMIT) return FALSE;
+            continue;
+        }
+        idle = 0;
+        u8 b;
+        if(Net_Recv(conn, &b, 1) == 0) return FALSE;
+        if(g_HttpHdrLen >= HTTP_HDR_MAX) return FALSE;
+        g_HttpHdrBuf[g_HttpHdrLen++] = (c8)b;
+        if(g_HttpHdrLen >= 4 &&
+           g_HttpHdrBuf[g_HttpHdrLen-4] == '\r' &&
+           g_HttpHdrBuf[g_HttpHdrLen-3] == '\n' &&
+           g_HttpHdrBuf[g_HttpHdrLen-2] == '\r' &&
+           g_HttpHdrBuf[g_HttpHdrLen-1] == '\n')
+        {
+            return TRUE;
+        }
+    }
+}
+
+// Parsea la primera linea (method, path) y algunos headers que nos importan.
+// Devuelve TRUE si la peticion es minimamente valida.
+static bool HttpParseRequest(void)
+{
+    u16 i = 0;
+    // Method
+    u8 mi = 0;
+    while(i < g_HttpHdrLen && g_HttpHdrBuf[i] != ' ' && mi < 7) {
+        g_HttpReqMethod[mi++] = g_HttpHdrBuf[i++];
+    }
+    g_HttpReqMethod[mi] = 0;
+    if(g_HttpHdrBuf[i] != ' ') return FALSE;
+    i++;
+    // Path
+    u8 pi = 0;
+    while(i < g_HttpHdrLen && g_HttpHdrBuf[i] != ' ' && g_HttpHdrBuf[i] != '\r' && pi < 79) {
+        g_HttpReqPath[pi++] = g_HttpHdrBuf[i++];
+    }
+    g_HttpReqPath[pi] = 0;
+    if(pi == 0) return FALSE;
+
+    // Headers — parsea solo los que nos interesan
+    g_HttpReqContentLen = 0;
+    g_HttpReqHasRange = FALSE;
+    g_HttpReqRangeStart = 0;
+    g_HttpReqForceOverwrite = FALSE;
+
+    while(i < g_HttpHdrLen) {
+        // Avanzar a inicio de linea siguiente
+        while(i < g_HttpHdrLen && g_HttpHdrBuf[i] != '\n') i++;
+        if(i >= g_HttpHdrLen) break;
+        i++;   // tras el \n
+        if(g_HttpHdrBuf[i] == '\r') break;  // linea vacia → fin headers
+        if(StartsWithI(&g_HttpHdrBuf[i], "content-length:")) {
+            u16 j = i + 15;
+            while(j < g_HttpHdrLen && (g_HttpHdrBuf[j] == ' ' || g_HttpHdrBuf[j] == '\t')) j++;
+            ParseU32Str(&g_HttpHdrBuf[j], &g_HttpReqContentLen);
+        } else if(StartsWithI(&g_HttpHdrBuf[i], "range:")) {
+            // bytes=N-... — extraemos solo N
+            u16 j = i + 6;
+            while(j < g_HttpHdrLen && (g_HttpHdrBuf[j] == ' ' || g_HttpHdrBuf[j] == '\t')) j++;
+            if(StartsWithI(&g_HttpHdrBuf[j], "bytes=")) {
+                j += 6;
+                u32 start;
+                if(ParseU32Str(&g_HttpHdrBuf[j], &start)) {
+                    g_HttpReqHasRange = TRUE;
+                    g_HttpReqRangeStart = start;
+                }
+            }
+        } else if(StartsWithI(&g_HttpHdrBuf[i], "if-match:")) {
+            u16 j = i + 9;
+            while(j < g_HttpHdrLen && (g_HttpHdrBuf[j] == ' ' || g_HttpHdrBuf[j] == '\t')) j++;
+            if(g_HttpHdrBuf[j] == '*') g_HttpReqForceOverwrite = TRUE;
+        }
+    }
+    return TRUE;
+}
+
+// Extrae query param numerico del path. Devuelve TRUE si encontrado.
+static bool HttpQueryParamU32(const c8* name, u32* out)
+{
+    u8 nameLen = 0;
+    while(name[nameLen]) nameLen++;
+    // Busca '?' en path
+    c8* p = g_HttpReqPath;
+    while(*p && *p != '?') p++;
+    if(!*p) return FALSE;
+    p++;
+    while(*p) {
+        // Match nombre seguido de '='
+        u8 k = 0;
+        while(k < nameLen && p[k] == name[k]) k++;
+        if(k == nameLen && p[k] == '=') {
+            p += k + 1;
+            return ParseU32Str(p, out);
+        }
+        // Saltar hasta '&' o fin
+        while(*p && *p != '&') p++;
+        if(*p == '&') p++;
+    }
+    return FALSE;
+}
+
+// Strip query string del path para procesado del fichero
+static void HttpStripQuery(void)
+{
+    c8* p = g_HttpReqPath;
+    while(*p) { if(*p == '?') { *p = 0; return; } p++; }
+}
+
+// ── respuestas de error ──
+static void HttpSendError(NetConn conn, u16 code, const c8* reason, const c8* body)
+{
+    u16 bodyLen = 0;
+    while(body[bodyLen]) bodyLen++;
+    HttpSendStr(conn, "HTTP/1.0 ");
+    HttpSendU32(conn, (u32)code);
+    HttpSendStr(conn, " ");
+    HttpSendStr(conn, reason);
+    HttpSendStr(conn, "\r\nContent-Type: text/plain\r\nContent-Length: ");
+    HttpSendU32(conn, (u32)bodyLen);
+    HttpSendStr(conn, "\r\nConnection: close\r\n\r\n");
+    HttpSendStr(conn, body);
+}
+
+// ── GET / — pagina HTML simple ──
+static void HttpHandleGetRoot(NetConn conn)
+{
+    static const c8 body[] =
+        "<!doctype html><html><head><meta charset=\"ascii\">"
+        "<title>NTS MSX</title></head><body style=\"font-family:monospace\">"
+        "<h2>MSX Net Transfer server</h2>"
+        "<p>This is an MSX serving files over HTTP. "
+        "Try <a href=\"/_list\">/_list</a> for the file listing.</p>"
+        "</body></html>\n";
+    u16 bodyLen = sizeof(body) - 1;
+    HttpSendStr(conn, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: ");
+    HttpSendU32(conn, (u32)bodyLen);
+    HttpSendStr(conn, "\r\nConnection: close\r\n\r\n");
+    Net_Send(conn, (const u8*)body, bodyLen);
+}
+
+// ── GET /_list — listado con paginacion ──
+// Hace dos pasadas por FFIRST/FNEXT:
+//   1ª: cuenta total (X-Total-Count)
+//   2ª: salta `from`, emite hasta `limit` lineas "name<TAB>size<LF>"
+// Como Content-Length se debe enviar antes del body, primero construimos
+// el body en g_HttpResp y luego mandamos cabecera + cuerpo de una.
+// Para 256 entradas con 8.3 nombres maxima longitud = 256 * 17 = 4352 B.
+// g_HttpResp es 1024 — insuficiente. Solucion: usamos un buffer mas grande
+// reusando g_Files[] como espacio temporal (8 KB en BSS, no en uso durante
+// el servicio HTTP porque la UI esta congelada).
+static void HttpHandleGetList(NetConn conn, u32 from, u32 limit)
+{
+    // Buffer de body — reusamos g_Files como area de bytes (8 KB)
+    c8* bodyBuf = (c8*)g_Files;
+    const u16 bodyMax = sizeof(g_Files);
+    u16 bodyLen = 0;
+
+    if(limit == 0) limit = 256;
+    if(limit > 256) limit = 256;
+
+    // 1ª pasada: contar total
+    u32 total = 0;
+    {
+        DOS_FIB* fib = DOS_FindFirstEntry("*.*", 0);
+        while(fib) {
+            if((fib->Attribute & ATTR_FOLDER) == 0 &&
+               (fib->Attribute & ATTR_DEVICE) == 0)
+            {
+                total++;
+            }
+            fib = DOS_FindNextEntry();
+        }
+    }
+
+    // 2ª pasada: salta from, emite hasta limit
+    {
+        DOS_FIB* fib = DOS_FindFirstEntry("*.*", 0);
+        u32 seen = 0;
+        u32 emitted = 0;
+        while(fib && emitted < limit) {
+            if((fib->Attribute & ATTR_FOLDER) == 0 &&
+               (fib->Attribute & ATTR_DEVICE) == 0)
+            {
+                if(seen >= from) {
+                    // Format "name\tsize\n" en bodyBuf
+                    u8 k;
+                    for(k = 0; k < 13 && fib->Filename[k] && bodyLen < bodyMax; k++) {
+                        bodyBuf[bodyLen++] = fib->Filename[k];
+                    }
+                    if(bodyLen < bodyMax) bodyBuf[bodyLen++] = '\t';
+                    // size as decimal
+                    {
+                        c8 tmp[12]; u8 n = 0; u32 sz = fib->Size;
+                        if(sz == 0) tmp[n++] = '0';
+                        else { while(sz) { tmp[n++] = '0' + (u8)(sz % 10); sz /= 10; } }
+                        while(n && bodyLen < bodyMax) bodyBuf[bodyLen++] = tmp[--n];
+                    }
+                    if(bodyLen < bodyMax) bodyBuf[bodyLen++] = '\n';
+                    emitted++;
+                }
+                seen++;
+            }
+            fib = DOS_FindNextEntry();
+        }
+    }
+
+    // Enviar headers + body
+    HttpSendStr(conn, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
+    HttpSendU32(conn, (u32)bodyLen);
+    HttpSendStr(conn, "\r\nX-Total-Count: ");
+    HttpSendU32(conn, total);
+    HttpSendStr(conn, "\r\nX-Page-Start: ");
+    HttpSendU32(conn, from);
+    HttpSendStr(conn, "\r\nConnection: close\r\n\r\n");
+    if(bodyLen > 0) {
+        Net_Send(conn, (const u8*)bodyBuf, bodyLen);
+    }
+}
+
+// ── GET /<file> ──
+static void HttpHandleGetFile(NetConn conn, const c8* path)
+{
+    c8 fname[16];
+    if(!SafeFilename(path, fname)) {
+        HttpSendError(conn, 400, "Bad Request", "bad path\n");
+        return;
+    }
+    // FFIRST para saber tamaño
+    DOS_FIB* fib = DOS_FindFirstEntry(fname, 0);
+    if(!fib) {
+        HttpSendError(conn, 404, "Not Found", "no such file\n");
+        return;
+    }
+    u32 total = fib->Size;
+    u32 start = g_HttpReqHasRange ? g_HttpReqRangeStart : 0;
+    if(start >= total) {
+        HttpSendError(conn, 416, "Range Not Satisfiable", "range past EOF\n");
+        return;
+    }
+    u32 length = total - start;
+    u16 status = g_HttpReqHasRange ? 206 : 200;
+    const c8* statusText = g_HttpReqHasRange ? "Partial Content" : "OK";
+
+    // Open
+    u8 fh = DOS_OpenHandle(fname, O_RDONLY);
+    if(fh == 0xFF) {
+        HttpSendError(conn, 500, "Server Error", "open failed\n");
+        return;
+    }
+    // Seek si Range
+    if(start > 0) {
+        // SeekHandle: hace falta — MSXgl lo tiene
+        DOS_SeekHandle(fh, (i32)start, SEEK_SET);
+    }
+
+    // Headers
+    HttpSendStr(conn, "HTTP/1.0 ");
+    HttpSendU32(conn, (u32)status);
+    HttpSendStr(conn, " ");
+    HttpSendStr(conn, statusText);
+    HttpSendStr(conn, "\r\nContent-Type: application/octet-stream\r\nContent-Length: ");
+    HttpSendU32(conn, length);
+    HttpSendStr(conn, "\r\nAccept-Ranges: bytes\r\nConnection: close\r\n");
+    if(status == 206) {
+        HttpSendStr(conn, "Content-Range: bytes ");
+        HttpSendU32(conn, start);
+        HttpSendStr(conn, "-");
+        HttpSendU32(conn, start + length - 1);
+        HttpSendStr(conn, "/");
+        HttpSendU32(conn, total);
+        HttpSendStr(conn, "\r\n");
+    }
+    HttpSendStr(conn, "\r\n");
+
+    // Body
+    while(length > 0) {
+        u16 want = (length > HTTP_BODY_CHUNK) ? HTTP_BODY_CHUNK : (u16)length;
+        u16 got = DOS_ReadHandle(fh, g_HttpRxBuf, want);
+        if(got == 0) break;
+        if(!Net_Send(conn, g_HttpRxBuf, got)) break;
+        length -= got;
+    }
+    DOS_CloseHandle(fh);
+}
+
+// ── PUT — recibe body en .PRT y al terminar rename a nombre final ──
+static void HttpHandlePut(NetConn conn)
+{
+    c8 fname[16];
+    c8 partname[16];
+    u8 fh;
+    u32 remaining;
+    bool ok;
+
+    if(!g_UploadsOn) {
+        HttpSendError(conn, 403, "Forbidden", "uploads disabled on this server\n");
+        return;
+    }
+    if(!SafeFilename(g_HttpReqPath, fname)) {
+        HttpSendError(conn, 400, "Bad Request", "bad path\n");
+        return;
+    }
+    if(g_HttpReqContentLen == 0) {
+        HttpSendError(conn, 411, "Length Required", "Content-Length required for PUT\n");
+        return;
+    }
+    if(g_HttpReqContentLen > 16UL * 1024 * 1024) {
+        HttpSendError(conn, 413, "Payload Too Large", "max 16 MiB\n");
+        return;
+    }
+
+    // Politica de colision
+    bool exists = (DOS_FindFirstEntry(fname, 0) != 0);
+    if(exists && !g_HttpReqForceOverwrite) {
+        HttpSendError(conn, 409, "Conflict",
+                      "file exists; use If-Match: * to overwrite\n");
+        return;
+    }
+
+    // Construye nombre temporal: base + ".PRT" (sustituye extension original)
+    {
+        u8 k = 0;
+        while(fname[k] && fname[k] != '.' && k < 8) {
+            partname[k] = fname[k];
+            k++;
+        }
+        partname[k++] = '.';
+        partname[k++] = 'P';
+        partname[k++] = 'R';
+        partname[k++] = 'T';
+        partname[k] = 0;
+    }
+    // Borra .PRT residual si lo hay
+    DOS_Delete(partname);
+
+    fh = DOS_CreateHandle(partname, O_WRONLY, 0);
+    if(fh == 0xFF) {
+        HttpSendError(conn, 500, "Server Error", "create failed on .PRT\n");
+        return;
+    }
+
+    // Stream body -> .PRT en chunks de HTTP_BODY_CHUNK
+    remaining = g_HttpReqContentLen;
+    ok = TRUE;
+    {
+        u16 idle = 0;
+        while(remaining > 0) {
+            u16 avail = Net_Available(conn);
+            if(avail == 0) {
+                if(!Net_IsConnected(conn)) { ok = FALSE; break; }
+                if(++idle > IDLE_LIMIT)    { ok = FALSE; break; }
+                continue;
+            }
+            idle = 0;
+            u16 want = (remaining > HTTP_BODY_CHUNK) ? HTTP_BODY_CHUNK : (u16)remaining;
+            if(want > avail) want = avail;
+            u16 got = Net_Recv(conn, g_HttpRxBuf, want);
+            if(got == 0) { ok = FALSE; break; }
+            u16 wrote = DOS_WriteHandle(fh, g_HttpRxBuf, got);
+            if(wrote != got) { ok = FALSE; break; }
+            remaining -= got;
+        }
+    }
+    DOS_CloseHandle(fh);
+
+    if(!ok) {
+        DOS_Delete(partname);
+        HttpSendError(conn, 400, "Bad Request", "body truncated or write failed\n");
+        return;
+    }
+
+    // Borra dest si existe (overwrite o no, ya validamos arriba)
+    if(exists) DOS_Delete(fname);
+
+    // Renombra .PRT -> fname. MSXgl solo wrappea HRENAME (0x53) que necesita
+    // un handle abierto. Reabrimos el .PRT en lectura, lo renombramos, cerramos.
+    u8 rfh = DOS_OpenHandle(partname, O_RDONLY);
+    if(rfh == 0xFF) {
+        DOS_Delete(partname);
+        HttpSendError(conn, 500, "Server Error", "reopen .PRT for rename failed\n");
+        return;
+    }
+    u8 rerr = DOS_RenameHandle(rfh, fname);
+    DOS_CloseHandle(rfh);
+    if(rerr != 0) {
+        DOS_Delete(partname);
+        HttpSendError(conn, 500, "Server Error", "rename failed\n");
+        return;
+    }
+
+    // 201 Created si nuevo, 200 OK si sobreescribio
+    u16 status = exists ? 200 : 201;
+    const c8* statusText = exists ? "OK" : "Created";
+    HttpSendStr(conn, "HTTP/1.0 ");
+    HttpSendU32(conn, (u32)status);
+    HttpSendStr(conn, " ");
+    HttpSendStr(conn, statusText);
+    HttpSendStr(conn, "\r\nContent-Type: text/plain\r\nContent-Length: ");
+    {
+        // body = path + "\n"
+        u8 nlen = 0;
+        while(g_HttpReqPath[nlen]) nlen++;
+        HttpSendU32(conn, (u32)(nlen + 1));
+    }
+    HttpSendStr(conn, "\r\nConnection: close\r\n\r\n");
+    HttpSendStr(conn, g_HttpReqPath);
+    HttpSendStr(conn, "\n");
+}
+
+// ── dispatcher de una peticion completa ──
+static void HttpServeOne(NetConn conn)
+{
+    if(!HttpReadHeaders(conn)) {
+        HttpSendError(conn, 400, "Bad Request", "header read failed\n");
+        return;
+    }
+    if(!HttpParseRequest()) {
+        HttpSendError(conn, 400, "Bad Request", "malformed request\n");
+        return;
+    }
+
+    // ── reflejar en UI ──
+    Scr_Locate(0, STATUS_ROW);
+    Scr_EraseEOL();
+    Scr_PutStr("Serving ");
+    Scr_PutStr(g_HttpReqMethod);
+    Scr_PutChar(' ');
+    {
+        u8 k;
+        for(k = 0; g_HttpReqPath[k] && k < 60; k++) Scr_PutChar(g_HttpReqPath[k]);
+    }
+
+    // Method dispatch
+    if(g_HttpReqMethod[0] == 'G' && g_HttpReqMethod[1] == 'E' &&
+       g_HttpReqMethod[2] == 'T' && g_HttpReqMethod[3] == 0)
+    {
+        // Strip query antes de comparar path
+        c8 fullPath[80];
+        {
+            u8 k;
+            for(k = 0; g_HttpReqPath[k] && k < 79; k++) fullPath[k] = g_HttpReqPath[k];
+            fullPath[k] = 0;
+        }
+        // Comprobar /_list (con o sin query)
+        bool isList = (g_HttpReqPath[0] == '/' && g_HttpReqPath[1] == '_' &&
+                       g_HttpReqPath[2] == 'l' && g_HttpReqPath[3] == 'i' &&
+                       g_HttpReqPath[4] == 's' && g_HttpReqPath[5] == 't' &&
+                       (g_HttpReqPath[6] == 0 || g_HttpReqPath[6] == '?' ||
+                        g_HttpReqPath[6] == '/'));
+        if(isList) {
+            u32 from = 0, limit = 256;
+            HttpQueryParamU32("from", &from);
+            HttpQueryParamU32("limit", &limit);
+            HttpHandleGetList(conn, from, limit);
+        } else if(g_HttpReqPath[0] == '/' && g_HttpReqPath[1] == 0) {
+            HttpHandleGetRoot(conn);
+        } else {
+            HttpStripQuery();
+            UrlDecodeInPlace(g_HttpReqPath);
+            HttpHandleGetFile(conn, g_HttpReqPath);
+        }
+    }
+    else if(g_HttpReqMethod[0] == 'H' && g_HttpReqMethod[1] == 'E' &&
+            g_HttpReqMethod[2] == 'A' && g_HttpReqMethod[3] == 'D')
+    {
+        // Implementacion minima: como GET pero sin body (cerramos antes)
+        HttpSendError(conn, 200, "OK", "");
+    }
+    else if(g_HttpReqMethod[0] == 'P' && g_HttpReqMethod[1] == 'U' &&
+            g_HttpReqMethod[2] == 'T' && g_HttpReqMethod[3] == 0)
+    {
+        HttpHandlePut(conn);
+    }
+    else {
+        HttpSendError(conn, 405, "Method Not Allowed", "use GET/HEAD/PUT\n");
+    }
+
+    g_RequestCount++;
+}
+
+// ── lifecycle ──
+static void Http_Start(void)
+{
+    if(g_Listener != NET_INVALID_CONN) return;
+    g_Listener = Net_OpenPassive(NTS_PORT);
+}
+
+static void Http_Stop(void)
+{
+    if(g_Listener == NET_INVALID_CONN) return;
+    Net_Abort(g_Listener);
+    g_Listener = NET_INVALID_CONN;
+}
+
+static void Http_Tick(void)
+{
+    if(g_Listener == NET_INVALID_CONN) return;
+    u8 r = Net_AcceptIfReady(g_Listener);
+    if(r == NET_ACCEPT_READY) {
+        NetConn c = g_Listener;
+        HttpServeOne(c);
+        Net_Close(c);
+        g_Listener = NET_INVALID_CONN;
+        // Re-arm
+        g_Listener = Net_OpenPassive(NTS_PORT);
+        // Refresca contador en pantalla
+        Scr_Locate(54, STATUS_ROW);
+        Scr_PutStr("Requests served: ");
+        Scr_PutU32(g_RequestCount);
+    } else if(r == NET_ACCEPT_ERROR) {
+        Net_Abort(g_Listener);
+        g_Listener = Net_OpenPassive(NTS_PORT);
+    }
+}
+
 //─────────────────────────────────────────────────────────────────
 // Main loop
 //─────────────────────────────────────────────────────────────────
@@ -462,7 +1107,25 @@ void main(void)
         if(IS_KEY_PRESSED(row5, KEY_S)) {
             WaitKeyRelease();
             g_SharingOn = !g_SharingOn;
-            // TODO: realmente abrir / cerrar el listener pasivo aqui
+            if(g_SharingOn) {
+                if(!g_NetReady) {
+                    // Sin UNAPI no podemos arrancar — revertir el toggle
+                    g_SharingOn = FALSE;
+                    Scr_Locate(0, STATUS_ROW);
+                    Scr_EraseEOL();
+                    Scr_PutStr("ERROR: UNAPI not loaded (run UNAPINET first)");
+                } else {
+                    Http_Start();
+                    if(g_Listener == NET_INVALID_CONN) {
+                        g_SharingOn = FALSE;
+                        Scr_Locate(0, STATUS_ROW);
+                        Scr_EraseEOL();
+                        Scr_PutStr("ERROR: cannot open passive socket on port 8088");
+                    }
+                }
+            } else {
+                Http_Stop();
+            }
             Ui_DrawHeader();
             continue;
         }
@@ -526,9 +1189,10 @@ void main(void)
             continue;
         }
 
-        // TODO: aqui ira tcpip_wait() y el chequeo del listener pasivo.
-        // Sin un yield, el bucle quema CPU — para la primera iteracion
-        // (sin red) no importa porque solo navegamos.
+        // HTTP server tick — solo cuando sharing esta ON
+        if(g_SharingOn) {
+            Http_Tick();
+        }
     }
 
     Scr_Restore();

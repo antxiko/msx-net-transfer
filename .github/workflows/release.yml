@@ -80,7 +80,8 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.gui }} ../dist/msx-net-transfer-${{ matrix.label }}/
           cp ../README.md ../dist/msx-net-transfer-${{ matrix.label }}/
           cp ../LICENSE   ../dist/msx-net-transfer-${{ matrix.label }}/
-          cp ../client/nt.com ../dist/msx-net-transfer-${{ matrix.label }}/NT.COM
+          cp ../client/nt.com     ../dist/msx-net-transfer-${{ matrix.label }}/NT.COM
+          cp ../server-msx/nts.com ../dist/msx-net-transfer-${{ matrix.label }}/NTS.COM
 
       - name: Pack (tar.gz)
         if: matrix.archive == 'tar.gz'

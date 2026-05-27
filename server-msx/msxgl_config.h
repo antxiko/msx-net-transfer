@@ -73,6 +73,9 @@
 #define DOS_USE_FCB                FALSE
 #define DOS_USE_HANDLE             TRUE
 #define DOS_USE_UTILITIES          TRUE
-#define DOS_USE_VALIDATOR          FALSE
+// IMPORTANTE: TRUE para que DOS_FindFirstEntry devuelva NULL si el fichero
+// no existe. Sin esto MSXgl siempre devuelve g_DOS_LastFIB (con datos del
+// FFIRST anterior) y servimos contenido equivocado bajo paths inexistentes.
+#define DOS_USE_VALIDATOR          TRUE
 #define DOS_USE_ERROR_HANDLER      FALSE
 #define DOS_USE_BIOSCALL           TRUE

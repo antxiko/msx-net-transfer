@@ -1,8 +1,10 @@
 # MSX Net Transfer
 
-**Share files from your PC to a real MSX over the network**, using the [MSX UNAPI TCP/IP](https://github.com/Konamiman/MSX-UNAPI-specification) standard.
+**Share files between your PC and a real MSX over the network**, using the [MSX UNAPI TCP/IP](https://github.com/Konamiman/MSX-UNAPI-specification) standard.
 
-Net Transfer is a tiny client/server pair that lets your MSX browse a folder on your modern PC and pull files down over plain HTTP, with no FTP, no SMB and no floppy gymnastics.
+Net Transfer is a small set of three programs — an interactive client on the MSX (`NT.COM`), a cross-platform server on the PC (`nthttp` / `nthttp-gui`), **and** an HTTP server that runs on the MSX itself (`NTS.COM`) — all speaking plain HTTP/1.0 to each other (and to curl / browsers). No FTP, no SMB, no floppy gymnastics.
+
+As of v0.2.3 every direction works: PC → MSX, MSX → PC, MSX → MSX, browser → MSX.
 
 ```
        PC (Windows/Linux/macOS)              MSX-DOS 2 with UNAPI TCP/IP
