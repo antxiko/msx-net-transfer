@@ -45,8 +45,28 @@
 #define FILTER_COUNT     4
 
 //─────────────────────────────────────────────────────────────────
+// NT.INI — lista de servidores
+//─────────────────────────────────────────────────────────────────
+#define MAX_INI_SERVERS   8
+#define INI_NAME_LEN     16   // chars max del nombre del servidor + NUL
+
+typedef struct {
+    c8  name[INI_NAME_LEN];
+    u8  ip[4];
+} IniServer;
+
+//─────────────────────────────────────────────────────────────────
 // Estado global
 //─────────────────────────────────────────────────────────────────
+// Carpeta de descargas — nombre configurable via NT.INI [config] DownloadDir=
+static c8 g_DownDirName[9];    // solo el nombre, ej: "downloads" (max 8 + NUL)
+static c8 g_DownDir[10];       // "\downloads"                    (1+8+NUL)
+static c8 g_DownDirPfx[11];    // "\downloads\"                   (1+8+1+NUL)
+static c8 g_DownDirSearch[14]; // "\downloads\*.*"                (1+8+1+3+NUL)
+
+static IniServer g_IniServers[MAX_INI_SERVERS];
+static u8        g_IniServerCount;
+
 static u8  g_Ip[4];
 static c8  g_HostHdr[24];
 
@@ -320,6 +340,236 @@ static void BuildHostHeader(void)
         while(n--) g_HostHdr[i++] = b[n];
     }
     g_HostHdr[i] = 0;
+}
+
+// Forward decl necesaria: WaitKeyRelease se define mas abajo pero
+// SelectServer la usa antes.
+static void WaitKeyRelease(void);
+
+//─────────────────────────────────────────────────────────────────
+// NT.INI parser
+// Formato:
+//   [servers]
+//   Nombre=192.168.0.102
+//   [config]
+//   DownloadDir=downloads
+//─────────────────────────────────────────────────────────────────
+
+// Parsea una linea del INI.
+// section: 0=ninguna, 1=servers, 2=config
+static void IniParseLine(const c8* ln, u8* section)
+{
+    const c8* eq;
+    const c8* val;
+    u8 keyLen, k;
+
+    while(*ln == ' ' || *ln == '\t') ln++;
+    if(*ln == 0 || *ln == ';' || *ln == '#') return;
+
+    if(*ln == '[') {
+        ln++;
+        if(StartsWithI(ln, "servers"))     *section = 1;
+        else if(StartsWithI(ln, "config")) *section = 2;
+        else                               *section = 0;
+        return;
+    }
+
+    eq = ln;
+    while(*eq && *eq != '=') eq++;
+    if(*eq != '=') return;
+    keyLen = (u8)(eq - ln);
+    if(keyLen == 0) return;
+
+    val = eq + 1;
+    while(*val == ' ' || *val == '\t') val++;
+
+    if(*section == 1 && g_IniServerCount < MAX_INI_SERVERS) {
+        if(ParseIPv4(val, g_IniServers[g_IniServerCount].ip)) {
+            for(k = 0; k < keyLen && k < INI_NAME_LEN - 1; k++)
+                g_IniServers[g_IniServerCount].name[k] = ln[k];
+            g_IniServers[g_IniServerCount].name[k] = 0;
+            g_IniServerCount++;
+        }
+    }
+
+    if(*section == 2) {
+        // DownloadDir=nombre  (11 chars en la clave)
+        if(keyLen == 11 && StartsWithI(ln, "downloaddir")) {
+            for(k = 0; val[k] && val[k] != ' ' && val[k] != '\t' &&
+                        val[k] != '\r' && val[k] != '\n' && k < 8; k++)
+                g_DownDirName[k] = val[k];
+            g_DownDirName[k] = 0;
+        }
+    }
+}
+
+// Lee NT.INI del directorio actual. Si no existe, no hace nada.
+static void LoadIni(void)
+{
+    u8  fh;
+    c8  line[64];
+    u8  lineLen;
+    u8  section;
+    c8  ch;
+    u16 got;
+
+    fh = DOS_OpenHandle("NT.INI", O_RDONLY);
+    if(fh == 0xFF) return;
+
+    section = 0;
+    lineLen = 0;
+
+    while(1) {
+        got = DOS_ReadHandle(fh, (u8*)&ch, 1);
+        if(got == 0) {
+            if(lineLen > 0) { line[lineLen] = 0; IniParseLine(line, &section); }
+            break;
+        }
+        if(ch == '\r') continue;
+        if(ch == '\n' || lineLen >= 63) {
+            line[lineLen] = 0;
+            IniParseLine(line, &section);
+            lineLen = 0;
+            if(ch == '\n') continue;
+        }
+        line[lineLen++] = ch;
+    }
+
+    DOS_CloseHandle(fh);
+}
+
+//─────────────────────────────────────────────────────────────────
+// Helpers para la carpeta de descargas
+//─────────────────────────────────────────────────────────────────
+
+// Devuelve TRUE si 'name' es un nombre de directorio MSX-DOS valido
+// (max 8 chars, sin espacios ni caracteres reservados).
+static bool IsValidDirName(const c8* name)
+{
+    u8 i, c;
+    if(name[0] == 0) return FALSE;
+    for(i = 0; name[i]; i++) {
+        if(i >= 8) return FALSE;
+        c = (u8)name[i];
+        if(c <= 0x20 || c > 0x7E) return FALSE;
+        if(c == '\\' || c == '/' || c == ':' ||
+           c == '*'  || c == '?' || c == '"' ||
+           c == '<'  || c == '>' || c == '|' ||
+           c == '.') return FALSE;
+    }
+    return TRUE;
+}
+
+// Construye g_DownDir, g_DownDirPfx y g_DownDirSearch desde g_DownDirName.
+static void BuildDownPaths(void)
+{
+    u8 k, i;
+    // g_DownDir = "\" + nombre
+    k = 0;
+    g_DownDir[k++] = '\\';
+    for(i = 0; g_DownDirName[i]; i++) g_DownDir[k++] = g_DownDirName[i];
+    g_DownDir[k] = 0;
+
+    // g_DownDirPfx = "\" + nombre + "\"
+    k = 0;
+    g_DownDirPfx[k++] = '\\';
+    for(i = 0; g_DownDirName[i]; i++) g_DownDirPfx[k++] = g_DownDirName[i];
+    g_DownDirPfx[k++] = '\\';
+    g_DownDirPfx[k] = 0;
+
+    // g_DownDirSearch = "\" + nombre + "\*.*"
+    k = 0;
+    for(i = 0; g_DownDirPfx[i]; i++) g_DownDirSearch[k++] = g_DownDirPfx[i];
+    g_DownDirSearch[k++] = '*';
+    g_DownDirSearch[k++] = '.';
+    g_DownDirSearch[k++] = '*';
+    g_DownDirSearch[k] = 0;
+}
+
+// Verifica que exista la carpeta de descargas; la crea si no existe.
+// En MSX-DOS 2, DOS_CreateHandle con ATTR_FOLDER (0x10) crea un directorio.
+static bool EnsureDownDir(void)
+{
+    DOS_FIB* fib;
+    u8 h;
+    fib = DOS_FindFirstEntry(g_DownDir, ATTR_FOLDER | ATTR_HIDDEN | ATTR_SYSTEM);
+    if(fib && (fib->Attribute & ATTR_FOLDER)) return TRUE;
+    h = DOS_CreateHandle(g_DownDir, 0, ATTR_FOLDER);
+    if(h == 0xFF) return FALSE;
+    DOS_CloseHandle(h);
+    return TRUE;
+}
+
+//─────────────────────────────────────────────────────────────────
+// Menu de seleccion de servidor (NT.INI con >1 servidor)
+//─────────────────────────────────────────────────────────────────
+static void DrawServerMenu(u8 sel)
+{
+    u8 k, n;
+    const c8* p;
+    Scr_Cls();
+    Scr_Locate(0, 0);
+    Scr_PutStr("NT v" NT_VERSION " - Seleccionar servidor");
+    Scr_HLine(1, '-');
+    for(k = 0; k < g_IniServerCount; k++) {
+        Scr_Locate(2, 3 + k);
+        Scr_PutChar(k == sel ? '>' : ' ');
+        Scr_PutChar(' ');
+        Scr_PutStr(g_IniServers[k].name);
+        // Pad nombre a INI_NAME_LEN chars para alinear las IPs
+        n = 0; p = g_IniServers[k].name; while(*p++) n++;
+        while(n < INI_NAME_LEN) { Scr_PutChar(' '); n++; }
+        Scr_PutStr("  ");
+        Scr_PutIP(g_IniServers[k].ip);
+    }
+    Scr_Locate(0, 3 + g_IniServerCount + 1);
+    Scr_PutStr("ARRIBA/ABAJO navegar   ENTER conectar   ESC salir");
+}
+
+// Selecciona servidor del INI. Si hay 1 solo, auto-selecciona sin menu.
+// Si hay >1, muestra el menu interactivo.
+// Rellena g_Ip y devuelve TRUE si OK; FALSE si no hay servidores o el
+// usuario pulso ESC.
+static bool SelectServer(void)
+{
+    u8 sel, k;
+    u8 row7, row8;
+
+    if(g_IniServerCount == 0) return FALSE;
+
+    if(g_IniServerCount == 1) {
+        for(k = 0; k < 4; k++) g_Ip[k] = g_IniServers[0].ip[k];
+        return TRUE;
+    }
+
+    sel = 0;
+    DrawServerMenu(sel);
+    WaitKeyRelease();
+
+    while(1) {
+        row7 = My_Snsmat(7);
+        row8 = My_Snsmat(8);
+
+        if(IS_KEY_PRESSED(row7, KEY_ESC)) { WaitKeyRelease(); return FALSE; }
+
+        if(IS_KEY_PRESSED(row7, KEY_RETURN)) {
+            WaitKeyRelease();
+            for(k = 0; k < 4; k++) g_Ip[k] = g_IniServers[sel].ip[k];
+            return TRUE;
+        }
+        if(IS_KEY_PRESSED(row8, KEY_UP) && sel > 0) {
+            sel--;
+            DrawServerMenu(sel);
+            WaitKeyRelease();
+            continue;
+        }
+        if(IS_KEY_PRESSED(row8, KEY_DOWN) && sel + 1 < g_IniServerCount) {
+            sel++;
+            DrawServerMenu(sel);
+            WaitKeyRelease();
+            continue;
+        }
+    }
 }
 
 //─────────────────────────────────────────────────────────────────
@@ -971,7 +1221,8 @@ static void DownloadProgress(u32 bytes, u32 total, bool haveTotal)
 static bool DownloadSelected(void)
 {
     const c8* srcName = g_Files[g_FilteredIdx[g_Selection]].name;
-    c8  dstName[16];
+    c8  dstName[16];           // nombre 8.3 en mayusculas
+    c8  fullPath[28];          // \downloads\NOMBRE.ROM — destino real
     c8  path[32];
     u8  file;
     HttpSink sink;
@@ -986,9 +1237,18 @@ static bool DownloadSelected(void)
 
     To83Upper(srcName, dstName);
 
-    // Si el fichero ya existe en el MSX, preguntar antes de sobreescribir.
+    // Ruta completa en la carpeta de descargas: "\downloads\NOMBRE.ROM"
     {
-        u8 existing = DOS_OpenHandle(dstName, O_RDONLY);
+        u8 k = 0, j;
+        const c8* pfx = g_DownDirPfx;
+        while(*pfx) fullPath[k++] = *pfx++;
+        for(j = 0; dstName[j]; j++) fullPath[k++] = dstName[j];
+        fullPath[k] = 0;
+    }
+
+    // Si el fichero ya existe en la carpeta de descargas, preguntar.
+    {
+        u8 existing = DOS_OpenHandle(fullPath, O_RDONLY);
         if(existing != 0xFF) {
             DOS_CloseHandle(existing);
             Ui_Status("File exists! ENTER=overwrite  ESC=skip");
@@ -1010,9 +1270,9 @@ static bool DownloadSelected(void)
         }
     }
 
-    file = DOS_CreateHandle(dstName, O_WRONLY, 0);
+    file = DOS_CreateHandle(fullPath, O_WRONLY, 0);
     if(file == 0xFF) {
-        Ui_Status("ERROR: cannot create destination file");
+        Ui_Status("ERROR: cannot create file in download folder");
         return FALSE;
     }
 
@@ -1045,7 +1305,7 @@ static bool DownloadSelected(void)
         Scr_PutStr("OK: ");
         Scr_PutU32(sink.written);
         Scr_PutStr(" bytes -> ");
-        Scr_PutStr(dstName);
+        Scr_PutStr(fullPath);
     } else {
         Scr_PutStr("ERROR: download failed (status=");
         Scr_PutU32((u32)g_StatusCode);
@@ -1515,11 +1775,15 @@ static void Browse(void)
 static void PrintUsage(void)
 {
     Scr_PutStr("NT v" NT_VERSION " - Net Transfer browser\r\n");
-    Scr_PutStr("Uso: NT <ip-servidor>\r\n");
+    Scr_PutStr("Uso: NT [ip-servidor]\r\n");
+    Scr_PutStr("  Si se omite la IP, se carga la lista de\r\n");
+    Scr_PutStr("  servidores de NT.INI [servers].\r\n");
     Scr_PutStr("Ej:  NT 192.168.0.102\r\n");
     Scr_PutStr("(Puerto fijo: ");
     Scr_PutU32((u32)NT_PORT);
     Scr_PutStr(")\r\n");
+    Scr_PutStr("NT.INI:  [servers]  Nombre=IP\r\n");
+    Scr_PutStr("         [config]   DownloadDir=nombre\r\n");
 }
 
 //─────────────────────────────────────────────────────────────────
@@ -1553,24 +1817,58 @@ void main(void)
     g_HaveContentLen = FALSE;
     g_FilterMode    = FILTER_ALL;
     g_FilteredCount = 0;
+    g_IniServerCount = 0;
     #if ENABLE_TRACE
     g_TraceLen       = 0;
     #endif
     g_HostHdr[0]     = 0;
     g_CmdLine[0]     = 0;
+    g_DownDirName[0] = 0;
     // No hace falta zerear los buffers grandes (g_RxBuf, g_ListBuf, g_HdrBuf,
     // g_Files) porque siempre se escriben antes de leerse.
+
+    // Carga NT.INI si existe (servidores, carpeta de descargas)
+    LoadIni();
+
+    // Carpeta de descargas: si no se configuro en el INI, usar "downloads".
+    if(g_DownDirName[0] == 0) {
+        const c8* def = "downloads";
+        u8 di;
+        for(di = 0; def[di]; di++) g_DownDirName[di] = def[di];
+        g_DownDirName[di] = 0;
+    }
+    if(!IsValidDirName(g_DownDirName)) {
+        Scr_PutStr("ERROR en NT.INI — DownloadDir=\"");
+        Scr_PutStr(g_DownDirName);
+        Scr_PutStr("\" invalido\r\n");
+        Scr_PutStr("  Max 8 chars, sin espacios ni: \\ / : * ? \" < > | .\r\n");
+        WaitEnter(); Scr_Restore(); return;
+    }
+    BuildDownPaths();
+    if(!EnsureDownDir()) {
+        Scr_PutStr("ERROR: no se puede crear la carpeta ");
+        Scr_PutStr(g_DownDir);
+        Scr_PutStr("\r\n");
+        WaitEnter(); Scr_Restore(); return;
+    }
 
     CmdLine_Capture();
     cursor = g_CmdLine;
     tok1 = NextToken(&cursor);
 
-    if(tok1 == 0) { PrintUsage(); WaitEnter(); Scr_Restore(); return; }
-    if(!ParseIPv4(tok1, g_Ip)) {
-        Scr_PutStr("ERROR: IP invalida\r\n");
-        WaitEnter();
-        Scr_Restore();
-        return;
+    if(tok1 != 0) {
+        // Argumento en linea de comandos — debe ser una IP
+        if(!ParseIPv4(tok1, g_Ip)) {
+            Scr_PutStr("ERROR: IP invalida\r\n");
+            WaitEnter(); Scr_Restore(); return;
+        }
+    } else if(g_IniServerCount == 0) {
+        // Sin IP y sin servidores en NT.INI — mostrar uso
+        PrintUsage(); WaitEnter(); Scr_Restore(); return;
+    } else {
+        // Sin IP en cmdline — seleccionar del INI (auto si 1, menu si >1)
+        if(!SelectServer()) { Scr_Restore(); return; }
+        Scr_Cls();
     }
     BuildHostHeader();
 
