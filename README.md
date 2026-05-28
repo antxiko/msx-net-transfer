@@ -4,7 +4,7 @@
 
 Net Transfer is a small set of three programs — an interactive client on the MSX (`NT.COM`), a cross-platform server on the PC (`nthttp` / `nthttp-gui`), **and** an HTTP server that runs on the MSX itself (`NTS.COM`) — all speaking plain HTTP/1.0 to each other (and to curl / browsers). No FTP, no SMB, no floppy gymnastics.
 
-As of v0.2.3 every direction works: PC → MSX, MSX → PC, MSX → MSX, browser → MSX.
+As of v0.2.3 every direction works: PC → MSX, MSX → PC, MSX → MSX, browser → MSX. As of v0.3.0 the MSX can find servers on the LAN **without typing an IP** — just run `NT`.
 
 ```
        PC (Windows/Linux/macOS)              MSX-DOS 2 with UNAPI TCP/IP
@@ -26,6 +26,7 @@ As of v0.2.3 every direction works: PC → MSX, MSX → PC, MSX → MSX, browser
 
 ## Features
 
+- **Zero-config discovery** (v0.3.0): run `NT` with no arguments and the MSX finds servers on the LAN automatically. The server *announces* its presence by UDP broadcast on port **8089** (`NT!` + port + name) every second; the MSX only *listens* — so it works on any UNAPI stack, since receiving a broadcast never needs special socket flags. If more than one server answers you get a numbered picker; a single server connects straight away.
 - **Two-process design**: a small GUI/CLI server on the PC and a single `NT.COM` on the MSX.
 - **Cross-platform server**: native binaries for Windows, Linux and macOS, built in Rust (eframe / egui).
 - **No protocol invention**: standard HTTP/1.0 — you can also browse the same folder from any web browser and `curl` works as a client too.
@@ -86,11 +87,14 @@ From the MSX-DOS 2 prompt:
 
 ```
 A:\>UNAPINET                    (or whatever loads your UNAPI TCP/IP stack)
+A:\>NT                          (no IP — auto-discover servers on the LAN)
 A:\>NT 192.168.0.102            (the IP shown by the server GUI)
 A:\>NT 192.168.0.102 /E:ROM     (start with the ROM-only extension filter active)
 A:\>NT 192.168.0.102 /E:DSK     (start with [DSK] filter)
 A:\>NT 192.168.0.102 /F         (force-overwrite on download, no prompt)
 ```
+
+Running `NT` with no IP listens for server announcements for a couple of seconds (a row of dots shows it's working) and then either connects to the only server found or shows a picker to choose between several. Auto-discovery of an MSX-hosted server (`NTS.COM`) requires a UNAPI stack that allows *sending* broadcast — fine on real hardware; some emulator bridges only allow receiving, in which case point the client at the MSX server with its IP directly.
 
 The screen switches to 80-column mode and the file browser appears.
 
@@ -127,6 +131,7 @@ The server is intentionally read-only. It exposes only `GET`/`HEAD` and never wr
 
 - The MSX and the PC must be reachable from each other on the LAN.
 - TCP port **8088** must not be blocked by your firewall (the GUI prompts on the first connection on Windows).
+- UDP port **8089** is used for zero-config discovery (server → broadcast, client → listen). If it's blocked, discovery won't work but typing the IP still does.
 - IPv4 only; the MSX UNAPI spec does not cover IPv6.
 
 ## Building from source
@@ -171,10 +176,16 @@ NetTransfer/
 ├── server/               # cross-platform server (Rust)
 │   ├── Cargo.toml
 │   └── src/
-│       ├── lib.rs        # reusable server core (HTTP/1.0, range, /_list)
+│       ├── lib.rs        # reusable server core (HTTP/1.0, range, /_list, announce)
 │       ├── main.rs       # CLI binary (nthttp)
 │       └── bin/
 │           └── gui.rs    # GUI binary (nthttp-gui, eframe/egui)
+├── server-msx/           # HTTP server that runs on the MSX itself (NTS.COM)
+│   ├── nts.c            # main source
+│   ├── network.h         # UNAPI TCP/UDP wrapper (passive listener + announce)
+│   ├── msxgl_config.h
+│   ├── project_config.js
+│   └── build.sh
 └── docs/                 # screenshots / extra docs
 ```
 

@@ -30,6 +30,14 @@ const WRITE_TIMEOUT_SECS: u64 = 60;
 const SEND_CHUNK: usize = 4096;
 const ACCEPT_POLL_MS: u64 = 100;
 
+/// Puerto UDP de descubrimiento. El server ANUNCIA su presencia por broadcast
+/// a este puerto y el MSX solo tiene que ESCUCHAR. El protocolo y los magic
+/// bytes estan documentados en `announce_loop`.
+pub const DISCOVERY_PORT: u16 = 8089;
+
+/// Intervalo entre anuncios de descubrimiento.
+const ANNOUNCE_INTERVAL_MS: u64 = 1000;
+
 //─────────────────────────────────────────────────────────────────
 // API publica
 //─────────────────────────────────────────────────────────────────
@@ -46,6 +54,12 @@ pub struct ServerConfig {
     /// Si FALSE, devuelve 409 Conflict salvo que la peticion incluya
     /// "If-Match: *" para forzar la sobreescritura puntualmente.
     pub overwrite: bool,
+    /// Habilita el anuncio UDP de descubrimiento por broadcast (a DISCOVERY_PORT).
+    /// Default true. Util desactivar en entornos LAN con muchos services.
+    pub discovery: bool,
+    /// Nombre que se anuncia en el descubrimiento. Hasta 32 chars ASCII.
+    /// Default: hostname del SO o "PC".
+    pub name: String,
 }
 
 impl Default for ServerConfig {
@@ -56,8 +70,25 @@ impl Default for ServerConfig {
             writable: false,
             max_upload: 16 * 1024 * 1024,
             overwrite: false,
+            discovery: true,
+            name: default_host_name(),
         }
     }
+}
+
+fn default_host_name() -> String {
+    if let Ok(h) = std::env::var("COMPUTERNAME") {
+        return h;
+    }
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        return h;
+    }
+    "PC".to_string()
+}
+
+/// Version publica de `default_host_name` para uso desde CLI/GUI.
+pub fn default_host_name_string() -> String {
+    default_host_name()
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +114,12 @@ pub enum ServerEvent {
         bytes: u64,
         overwrote: bool,
     },
+    /// Hemos emitido un anuncio de descubrimiento por broadcast.
+    /// `count` es el numero acumulado de anuncios enviados desde el arranque.
+    DiscoveryAnnounce {
+        time: SystemTime,
+        count: u64,
+    },
     /// Algo no fatal — error de I/O, peticion malformada, etc.
     Warning(String),
     /// El servidor ha parado (limpio).
@@ -99,6 +136,8 @@ pub struct Server {
     root: PathBuf,
     writable: Arc<AtomicBool>,
     overwrite: Arc<AtomicBool>,
+    discovery_name: Arc<std::sync::RwLock<String>>,
+    discovery_join: Option<JoinHandle<()>>,
 }
 
 /// Estado runtime mutable del servidor (writable, overwrite, etc.) compartido
@@ -159,6 +198,38 @@ impl Server {
                 );
             })?;
 
+        // ── Thread de descubrimiento UDP (si habilitado) ──
+        let discovery_name = Arc::new(std::sync::RwLock::new(cfg.name.clone()));
+        let discovery_join = if cfg.discovery {
+            let stop_for_disc = Arc::clone(&stop_flag);
+            let name_for_disc = Arc::clone(&discovery_name);
+            let tx_for_disc = tx.clone();
+            let server_port = local_addr.port();
+            // Puerto local efimero (no DISCOVERY_PORT): asi el server no ocupa
+            // el 8089 y un MSX que escuche en el mismo host (emulador) puede
+            // bindearlo sin conflicto. set_broadcast es lo que permite el
+            // sendto a 255.255.255.255.
+            match UdpSocket::bind(("0.0.0.0", 0)) {
+                Ok(sock) => {
+                    sock.set_broadcast(true).ok();
+                    let h = thread::Builder::new()
+                        .name("nthttp-discovery".to_string())
+                        .spawn(move || {
+                            announce_loop(sock, server_port, name_for_disc, stop_for_disc, tx_for_disc);
+                        })?;
+                    Some(h)
+                }
+                Err(e) => {
+                    let _ = tx.send(ServerEvent::Warning(format!(
+                        "discovery deshabilitado: no puedo abrir UDP: {}", e
+                    )));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Server {
             stop_flag,
             rx,
@@ -167,7 +238,20 @@ impl Server {
             root,
             writable,
             overwrite,
+            discovery_name,
+            discovery_join,
         })
+    }
+
+    /// Cambia el nombre que se anuncia en respuestas de descubrimiento.
+    pub fn set_discovery_name(&self, name: &str) {
+        if let Ok(mut n) = self.discovery_name.write() {
+            *n = name.to_string();
+        }
+    }
+
+    pub fn discovery_name(&self) -> String {
+        self.discovery_name.read().map(|n| n.clone()).unwrap_or_default()
     }
 
     /// Activa / desactiva uploads en caliente (sin reiniciar el servidor).
@@ -206,10 +290,13 @@ impl Server {
         self.rx.recv().ok()
     }
 
-    /// Para el servidor y espera a que termine el thread de accept.
+    /// Para el servidor y espera a que terminen los threads (accept + discovery).
     pub fn stop(mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        if let Some(join) = self.discovery_join.take() {
             let _ = join.join();
         }
     }
@@ -221,6 +308,69 @@ impl Drop for Server {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+        if let Some(join) = self.discovery_join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+//─────────────────────────────────────────────────────────────────
+// Announce loop — broadcast periodico de presencia a DISCOVERY_PORT
+//─────────────────────────────────────────────────────────────────
+//
+// Modelo: el server ANUNCIA, el MSX solo ESCUCHA. Esto es lo que hace que
+// funcione en cualquier pila UNAPI (GR8NET, BadCat, ESP-FPGA, openMSXnet):
+// recibir un datagrama broadcast no requiere ningun flag especial, mientras
+// que ENVIAR broadcast (el modelo inverso) exige SO_BROADCAST y no esta
+// garantizado en todos los bridges/stacks.
+//
+// Cada ANNOUNCE_INTERVAL_MS enviamos a 255.255.255.255:8089:
+//   "NT!"            (3 bytes ASCII magic)
+//   port_lo, port_hi (u16 LE — puerto TCP donde escucha el server)
+//   name_len         (u8 — longitud del nombre, 0..32)
+//   name             (name_len bytes ASCII, p.ej. "MyMSX")
+//   Total: 3 + 2 + 1 + N = 6..38 bytes
+//
+// El MSX escucha en 8089 unos segundos, deduplica por IP origen y se queda
+// con la lista de servers. El puerto al que conectar va en el payload, no en
+// el puerto origen del datagrama.
+//─────────────────────────────────────────────────────────────────
+
+fn announce_loop(
+    socket: UdpSocket,
+    server_port: u16,
+    name: Arc<std::sync::RwLock<String>>,
+    stop_flag: Arc<AtomicBool>,
+    tx: Sender<ServerEvent>,
+) {
+    let bcast = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
+    let mut count: u64 = 0;
+    while !stop_flag.load(Ordering::SeqCst) {
+        let name_str = name.read().map(|n| n.clone()).unwrap_or_default();
+        let nb = name_str.as_bytes();
+        let nlen = nb.len().min(32) as u8;
+        let mut msg = Vec::with_capacity(6 + nlen as usize);
+        msg.extend_from_slice(b"NT!");
+        let p = server_port.to_le_bytes();
+        msg.push(p[0]);
+        msg.push(p[1]);
+        msg.push(nlen);
+        msg.extend_from_slice(&nb[..nlen as usize]);
+
+        if socket.send_to(&msg, bcast).is_ok() {
+            count += 1;
+            let _ = tx.send(ServerEvent::DiscoveryAnnounce {
+                time: SystemTime::now(),
+                count,
+            });
+        }
+
+        // Dormir en trozos para reaccionar rapido al stop_flag.
+        let mut slept = 0u64;
+        while slept < ANNOUNCE_INTERVAL_MS && !stop_flag.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            slept += 100;
         }
     }
 }

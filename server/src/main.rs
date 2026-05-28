@@ -22,11 +22,21 @@ fn main() {
     let mut writable = false;
     let mut overwrite = false;
     let mut max_upload: u64 = 16 * 1024 * 1024;
+    let mut discovery: bool = true;
+    let mut name: Option<String> = None;
 
     let mut positionals: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--no-discovery" => discovery = false,
+            "--name" => {
+                name = args.next();
+                if name.is_none() {
+                    eprintln!("[ERR] --name requires a value");
+                    std::process::exit(2);
+                }
+            }
             "--writable"   => writable = true,
             "--overwrite"  => overwrite = true,
             "--max-upload" => {
@@ -60,6 +70,8 @@ fn main() {
         writable,
         max_upload,
         overwrite,
+        discovery,
+        name: name.unwrap_or_else(nettransfer_server::default_host_name_string),
     };
 
     let server = match Server::start(cfg) {
@@ -97,6 +109,13 @@ fn main() {
                     peer, path, bytes,
                     if overwrote { " [overwrote]" } else { "" }
                 );
+            }
+            Some(ServerEvent::DiscoveryAnnounce { count, .. }) => {
+                // El anuncio se repite cada segundo; solo informamos del primero
+                // para no inundar la consola.
+                if count == 1 {
+                    println!("◉ anunciando descubrimiento por broadcast :{}", nettransfer_server::DISCOVERY_PORT);
+                }
             }
             Some(ServerEvent::Warning(msg)) => {
                 eprintln!("[WARN] {}", msg);

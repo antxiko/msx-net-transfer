@@ -102,4 +102,56 @@ static u16 Net_Recv(NetConn conn, u8* buffer, u16 maxLen)
 
 static void Net_Flush(NetConn conn) { tcpip_tcp_flush((int)conn); }
 
+//─────────────────────────────────────────────────────────────────
+// UDP — usado por NT.COM para descubrimiento broadcast LAN
+//─────────────────────────────────────────────────────────────────
+static tcpip_unapi_udp_dtg_parms g_UdpParms;
+static tcpip_unapi_udp_state     g_UdpState;
+
+static NetConn Net_UdpOpen(u16 port)
+{
+    int err;
+    int handle = 0;
+    err = tcpip_udp_open((int)port, 0, &handle);
+    if(err != ERR_OK) return NET_INVALID_CONN;
+    return (NetConn)handle;
+}
+
+static void Net_UdpClose(NetConn conn) { tcpip_udp_close((int)conn); }
+
+static bool Net_UdpSend(NetConn conn, const u8* dstIp, u16 dstPort, const u8* data, u16 len)
+{
+    u8 i;
+    u8* p = (u8*)&g_UdpParms;
+    for(i = 0; i < sizeof(g_UdpParms); i++) p[i] = 0;
+    g_UdpParms.dest_ip[0] = dstIp[0];
+    g_UdpParms.dest_ip[1] = dstIp[1];
+    g_UdpParms.dest_ip[2] = dstIp[2];
+    g_UdpParms.dest_ip[3] = dstIp[3];
+    g_UdpParms.dest_port = (int)dstPort;
+    g_UdpParms.data_length = (int)len;
+    return (tcpip_udp_send((int)conn, &g_UdpParms, (char*)data) == ERR_OK);
+}
+
+static u8 Net_UdpAvailable(NetConn conn)
+{
+    if(tcpip_udp_state((int)conn, &g_UdpState) != ERR_OK) return 0;
+    return (u8)g_UdpState.num_of_pend_dtg;
+}
+
+static u16 Net_UdpRecv(NetConn conn, u8* buffer, u16 maxLen)
+{
+    if(tcpip_udp_rcv((int)conn, (char*)buffer, (int)maxLen, &g_UdpParms) != ERR_OK)
+        return 0;
+    return (u16)g_UdpParms.data_length;
+}
+
+static void Net_UdpLastSrcIP(u8* ipOut)
+{
+    ipOut[0] = (u8)g_UdpParms.dest_ip[0];
+    ipOut[1] = (u8)g_UdpParms.dest_ip[1];
+    ipOut[2] = (u8)g_UdpParms.dest_ip[2];
+    ipOut[3] = (u8)g_UdpParms.dest_ip[3];
+}
+
 #endif // NETWORK_H

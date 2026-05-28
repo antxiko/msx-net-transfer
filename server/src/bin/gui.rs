@@ -59,15 +59,21 @@ struct App {
     allow_uploads: bool,
     allow_overwrite: bool,
     upload_log: VecDeque<UploadEntry>,
+    // Discovery
+    server_name: String,
+    announce_count: u64,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_name: Option<String>) -> Self {
         let theme = Theme::Dark;
         apply_theme(&cc.egui_ctx, theme);
 
         let folder = fs::canonicalize(PathBuf::from(DEFAULT_FOLDER))
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_FOLDER));
+
+        let server_name = initial_name
+            .unwrap_or_else(nettransfer_server::default_host_name_string);
 
         let mut app = App {
             folder,
@@ -82,6 +88,8 @@ impl App {
             allow_uploads: false,         // por defecto, read-only
             allow_overwrite: false,
             upload_log: VecDeque::with_capacity(UPLOAD_LOG_MAX),
+            server_name,
+            announce_count: 0,
         };
         app.refresh_files();
         app
@@ -114,11 +122,14 @@ impl App {
             writable: self.allow_uploads,
             max_upload: MAX_UPLOAD_DEFAULT,
             overwrite: self.allow_overwrite,
+            discovery: true,
+            name: self.server_name.clone(),
         };
         match Server::start(cfg) {
             Ok(s) => {
                 self.request_count = 0;
                 self.last_request = None;
+                self.announce_count = 0;
                 self.server = Some(s);
                 self.refresh_files();
             }
@@ -177,6 +188,9 @@ impl App {
                     }
                     // Tras upload, refrescamos la lista local
                     self.refresh_files();
+                }
+                ServerEvent::DiscoveryAnnounce { count, .. } => {
+                    self.announce_count = count;
                 }
                 ServerEvent::Warning(msg) => {
                     self.last_error = Some(msg);
@@ -325,6 +339,28 @@ impl eframe::App for App {
             }
 
             ui.add_space(8.0);
+
+            // ── Nombre del server (para descubrimiento UDP) ──
+            ui.horizontal(|ui| {
+                ui.label("Nombre:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.server_name)
+                        .desired_width(200.0)
+                        .char_limit(32),
+                );
+                if response.changed() {
+                    if let Some(s) = &self.server {
+                        s.set_discovery_name(&self.server_name);
+                    }
+                }
+                if self.is_running() && self.announce_count > 0 {
+                    ui.add_space(8.0);
+                    ui.weak(format!("(anunciando :{} · {}x)",
+                        nettransfer_server::DISCOVERY_PORT, self.announce_count));
+                }
+            });
+
+            ui.add_space(4.0);
 
             // ── Carpeta a compartir ──
             // Muestra la ruta como label (no editable a mano) y ofrece un boton
@@ -609,6 +645,17 @@ fn human_size(n: u64) -> String {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Parse --name <NAME> override (todo lo demas se configura desde la GUI).
+    let mut initial_name: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--name" {
+            initial_name = args.next();
+        } else if let Some(rest) = a.strip_prefix("--name=") {
+            initial_name = Some(rest.to_string());
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 600.0])
@@ -619,6 +666,6 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "NetTransfer Server",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, initial_name.clone())))),
     )
 }

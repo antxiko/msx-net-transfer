@@ -177,4 +177,70 @@ static bool Net_GetRemoteIP(NetConn conn, u8* ipOut)
     return TRUE;
 }
 
+//─────────────────────────────────────────────────────────────────
+// UDP — para descubrimiento LAN via broadcast
+//─────────────────────────────────────────────────────────────────
+static tcpip_unapi_udp_dtg_parms g_UdpParms;
+static tcpip_unapi_udp_state     g_UdpState;
+
+// Abre socket UDP en port (use 0 para puerto aleatorio efimero).
+static NetConn Net_UdpOpen(u16 port)
+{
+    int err;
+    int handle = 0;
+    err = tcpip_udp_open((int)port, 0 /*lifetime — transient*/, &handle);
+    if(err != ERR_OK) { g_NetLastError = (u8)err; return NET_INVALID_CONN; }
+    return (NetConn)handle;
+}
+
+static void Net_UdpClose(NetConn conn) { tcpip_udp_close((int)conn); }
+
+// Envia un datagrama UDP. ip puede ser broadcast (255.255.255.255).
+static bool Net_UdpSend(NetConn conn, const u8* dstIp, u16 dstPort, const u8* data, u16 len)
+{
+    u8 i;
+    u8* p = (u8*)&g_UdpParms;
+    for(i = 0; i < sizeof(g_UdpParms); i++) p[i] = 0;
+    g_UdpParms.dest_ip[0] = dstIp[0];
+    g_UdpParms.dest_ip[1] = dstIp[1];
+    g_UdpParms.dest_ip[2] = dstIp[2];
+    g_UdpParms.dest_ip[3] = dstIp[3];
+    g_UdpParms.dest_port  = (int)dstPort;
+    g_UdpParms.data_length = (int)len;
+    int err = tcpip_udp_send((int)conn, &g_UdpParms, (char*)data);
+    g_NetLastError = (u8)err;
+    return (err == ERR_OK);
+}
+
+// Devuelve numero de datagramas pendientes (0 si nada).
+static u8 Net_UdpAvailable(NetConn conn)
+{
+    if(tcpip_udp_state((int)conn, &g_UdpState) != ERR_OK) return 0;
+    return (u8)g_UdpState.num_of_pend_dtg;
+}
+
+// Recibe UN datagrama. Tras la llamada g_UdpParms.dest_ip / dest_port
+// contienen la IP/puerto ORIGEN (no destino, a pesar del nombre del campo).
+// Devuelve el tamaño leido (0 si error).
+static u16 Net_UdpRecv(NetConn conn, u8* buffer, u16 maxLen)
+{
+    if(tcpip_udp_rcv((int)conn, (char*)buffer, (int)maxLen, &g_UdpParms) != ERR_OK)
+        return 0;
+    return (u16)g_UdpParms.data_length;
+}
+
+// Despues de Net_UdpRecv, devuelve la IP origen (4 bytes en ipOut).
+static void Net_UdpLastSrcIP(u8* ipOut)
+{
+    ipOut[0] = (u8)g_UdpParms.dest_ip[0];
+    ipOut[1] = (u8)g_UdpParms.dest_ip[1];
+    ipOut[2] = (u8)g_UdpParms.dest_ip[2];
+    ipOut[3] = (u8)g_UdpParms.dest_ip[3];
+}
+
+static u16 Net_UdpLastSrcPort(void)
+{
+    return (u16)g_UdpParms.dest_port;
+}
+
 #endif // NETWORK_H

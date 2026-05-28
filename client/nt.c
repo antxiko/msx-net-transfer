@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.2.2"
+#define NT_VERSION       "0.3.0"
 #define NT_PORT          8088
 #define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
@@ -47,6 +47,7 @@
 // Estado global
 //─────────────────────────────────────────────────────────────────
 static u8  g_Ip[4];
+static u16 g_Port = NT_PORT;   // puerto del server (descubierto o NT_PORT por defecto)
 static c8  g_HostHdr[24];
 
 typedef struct {
@@ -77,6 +78,17 @@ static u32 g_ContentLen;
 static bool g_HaveContentLen;
 
 static c8  g_CmdLine[129];
+
+// ── Discovery (v0.3) ──
+#define NT_DISCOVERY_PORT  8089
+#define MAX_SERVERS        8
+typedef struct {
+    u8  ip[4];
+    u16 port;
+    c8  name[24];
+} ServerInfo;
+static ServerInfo g_Servers[MAX_SERVERS];
+static u8 g_ServerCount;
 
 static u8  g_FilterMode;
 static u16 g_FilteredIdx[MAX_FILES];   // ahora u16 — index puede ser hasta 255
@@ -312,8 +324,8 @@ static void BuildHostHeader(void)
         while(n--) g_HostHdr[i++] = b[n];
         if(k < 3) g_HostHdr[i++] = '.';
     }
-    if(NT_PORT != 80) {
-        u16 p = NT_PORT; c8 b[6]; n = 0;
+    if(g_Port != 80) {
+        u16 p = g_Port; c8 b[6]; n = 0;
         while(p) { b[n++] = '0' + (p % 10); p /= 10; }
         g_HostHdr[i++] = ':';
         while(n--) g_HostHdr[i++] = b[n];
@@ -455,7 +467,7 @@ static bool HttpFetch(const c8* path, HttpSink* sink)
     #endif
 
     TRACE('O');                       // intento open
-    conn = Net_Open(g_Ip, NT_PORT);
+    conn = Net_Open(g_Ip, g_Port);
     if(conn == NET_INVALID_CONN) { TRACE('!'); return FALSE; }
     TRACE('o');                       // open OK
 
@@ -782,7 +794,7 @@ static void Ui_DrawFrame(void)
     Scr_PutStr("Server: ");
     Scr_PutIP(g_Ip);
     Scr_PutChar(':');
-    Scr_PutU32((u32)NT_PORT);
+    Scr_PutU32((u32)g_Port);
 
     Scr_HLine(1, '-');
     Scr_HLine(21, '-');
@@ -1070,7 +1082,7 @@ static u16 DoUpload(const c8* localName, bool forceOverwrite)
     fh = DOS_OpenHandle(localName, O_RDONLY);
     if(fh == 0xFF) return 0;
 
-    conn = Net_Open(g_Ip, NT_PORT);
+    conn = Net_Open(g_Ip, g_Port);
     if(conn == NET_INVALID_CONN) { DOS_CloseHandle(fh); return 1; }
 
     {
@@ -1509,8 +1521,138 @@ static void PrintUsage(void)
     Scr_PutStr("Uso: NT <ip-servidor>\r\n");
     Scr_PutStr("Ej:  NT 192.168.0.102\r\n");
     Scr_PutStr("(Puerto fijo: ");
-    Scr_PutU32((u32)NT_PORT);
+    Scr_PutU32((u32)g_Port);
     Scr_PutStr(")\r\n");
+}
+
+//─────────────────────────────────────────────────────────────────
+// Discovery (v0.3) — el MSX solo ESCUCHA. El server PC/MSX anuncia su
+// presencia por broadcast a 255.255.255.255:8089 cada ~1s. Nosotros abrimos
+// un socket UDP en el 8089 y recolectamos anuncios "NT!" + port + name durante
+// una ventana fija, deduplicando por IP origen.
+//
+// Por que escuchar y no preguntar: recibir un datagrama broadcast NO requiere
+// ningun flag especial en la pila UNAPI, asi que funciona en GR8NET, BadCat,
+// ESP-FPGA y openMSXnet por igual. ENVIAR broadcast (el modelo inverso) exige
+// SO_BROADCAST y no esta garantizado en todos los bridges.
+//
+// Devuelve numero de servers encontrados (en g_Servers).
+//─────────────────────────────────────────────────────────────────
+static u8 DiscoverServers(void)
+{
+    NetConn udp;
+    u8 buf[64];
+    u16 ticks;
+    u16 spin;
+    u8 saw_dup;
+
+    g_ServerCount = 0;
+
+    // Escuchamos en el puerto de descubrimiento donde el server anuncia.
+    udp = Net_UdpOpen(NT_DISCOVERY_PORT);
+    if(udp == NET_INVALID_CONN) return 0;
+
+    // Salimos en cuanto vemos un anuncio DUPLICADO: como cada server anuncia
+    // ~1 vez/s, ver un duplicado significa que ya paso un ciclo completo y
+    // todos los servers de la LAN han anunciado al menos una vez. El tope de
+    // ~5s (saw_dup nunca llega) cubre el caso de que no haya ningun server.
+    // Mientras tanto pintamos puntos para que no parezca colgado.
+    ticks = 0;
+    spin = 0;
+    saw_dup = 0;
+    while(ticks < 6000 && !saw_dup) {
+        ticks++;
+
+        // Feedback visual: un punto cada ~0.3s.
+        if(++spin >= 350) {
+            spin = 0;
+            Scr_PutChar('.');
+        }
+
+        if(Net_UdpAvailable(udp) > 0) {
+            u16 n = Net_UdpRecv(udp, buf, sizeof(buf));
+            if(n >= 6 && buf[0] == 'N' && buf[1] == 'T' && buf[2] == '!') {
+                u8 ip[4];
+                u16 port = (u16)buf[3] | ((u16)buf[4] << 8);
+                u8 dup = 0, j;
+                Net_UdpLastSrcIP(ip);
+                // Dedup por IP+puerto (los anuncios se repiten cada segundo, y
+                // pueden coexistir 2 servers en la misma IP con puertos distintos).
+                for(j = 0; j < g_ServerCount; j++) {
+                    if(g_Servers[j].ip[0] == ip[0] && g_Servers[j].ip[1] == ip[1] &&
+                       g_Servers[j].ip[2] == ip[2] && g_Servers[j].ip[3] == ip[3] &&
+                       g_Servers[j].port == port) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if(dup) {
+                    // Ciclo completo visto → ya tenemos a todos, salimos ya.
+                    if(g_ServerCount > 0) saw_dup = 1;
+                } else if(g_ServerCount < MAX_SERVERS) {
+                    ServerInfo* s = &g_Servers[g_ServerCount];
+                    s->ip[0] = ip[0]; s->ip[1] = ip[1];
+                    s->ip[2] = ip[2]; s->ip[3] = ip[3];
+                    s->port = port;
+                    u8 nlen = buf[5];
+                    if(nlen > 23) nlen = 23;
+                    u8 k;
+                    for(k = 0; k < nlen && (6 + k) < n; k++) s->name[k] = (c8)buf[6 + k];
+                    s->name[k] = 0;
+                    g_ServerCount++;
+                }
+            }
+        }
+    }
+    Scr_PutStr("\r\n");
+    Net_UdpClose(udp);
+    return g_ServerCount;
+}
+
+// Picker simple: muestra lista numerada, espera tecla 1..MAX_SERVERS o ESC.
+// Devuelve indice elegido en g_Servers, o 0xFF si cancela.
+static u8 PickServer(void)
+{
+    if(g_ServerCount == 0) return 0xFF;
+    if(g_ServerCount == 1) return 0;
+
+    Scr_Cls();
+    Scr_Locate(0, 0);
+    Scr_PutStr("NT v" NT_VERSION " - Discovery");
+    Scr_HLine(1, '-');
+
+    {
+        u8 i;
+        for(i = 0; i < g_ServerCount; i++) {
+            Scr_Locate(2, 3 + i);
+            Scr_PutChar('0' + i + 1);
+            Scr_PutStr(") ");
+            { u8 k; for(k = 0; g_Servers[i].name[k] && k < 23; k++) Scr_PutChar(g_Servers[i].name[k]); }
+            Scr_PutStr("    ");
+            Scr_PutIP(g_Servers[i].ip);
+            Scr_PutChar(':');
+            Scr_PutU32((u32)g_Servers[i].port);
+        }
+    }
+    Scr_Locate(0, 21);
+    Scr_HLine(21, '-');
+    Scr_Locate(0, 22);
+    Scr_PutStr("Pulsa 1-");
+    Scr_PutChar('0' + g_ServerCount);
+    Scr_PutStr(" para conectar, ESC para cancelar");
+
+    // Wait for digit / ESC
+    while(1) {
+        u8 row0 = My_Snsmat(0);   // KEY_1..KEY_7
+        u8 row1 = My_Snsmat(1);   // KEY_8, KEY_9
+        u8 row7 = My_Snsmat(7);   // KEY_ESC
+        u8 d;
+        if(IS_KEY_PRESSED(row7, KEY_ESC)) { WaitKeyRelease(); return 0xFF; }
+        for(d = 1; d <= 7 && d <= g_ServerCount; d++) {
+            if(IS_KEY_PRESSED(row0, MAKE_KEY(0, d))) { WaitKeyRelease(); return d - 1; }
+        }
+        if(g_ServerCount >= 8 && IS_KEY_PRESSED(row1, KEY_8)) { WaitKeyRelease(); return 7; }
+    }
 }
 
 //─────────────────────────────────────────────────────────────────
@@ -1549,6 +1691,8 @@ void main(void)
     #endif
     g_HostHdr[0]     = 0;
     g_CmdLine[0]     = 0;
+    g_ServerCount    = 0;
+    g_Port           = NT_PORT;
     // No hace falta zerear los buffers grandes (g_RxBuf, g_ListBuf, g_HdrBuf,
     // g_Files) porque siempre se escriben antes de leerse.
 
@@ -1556,15 +1700,7 @@ void main(void)
     cursor = g_CmdLine;
     tok1 = NextToken(&cursor);
 
-    if(tok1 == 0) { PrintUsage(); WaitEnter(); Scr_Restore(); return; }
-    if(!ParseIPv4(tok1, g_Ip)) {
-        Scr_PutStr("ERROR: IP invalida\r\n");
-        WaitEnter();
-        Scr_Restore();
-        return;
-    }
-    BuildHostHeader();
-
+    // Necesitamos UNAPI tanto para descubrimiento como para HTTP — Net_Init primero.
     if(!Net_Init()) {
         Scr_PutStr("ERROR: no UNAPI TCP/IP. Ejecuta UNAPINET antes.\r\n");
         WaitEnter();
@@ -1572,10 +1708,42 @@ void main(void)
         return;
     }
 
+    if(tok1 == 0) {
+        // ── Sin IP: descubrimiento automatico ──
+        Scr_PutStr("Buscando servers Net Transfer en la LAN...\r\n");
+        DiscoverServers();
+        if(g_ServerCount == 0) {
+            Scr_PutStr("No se ha encontrado ningun server.\r\n");
+            Scr_PutStr("Arranca el server en el PC (nthttp-gui) o en otro MSX (NTS).\r\n");
+            Scr_PutStr("O ejecuta: NT <ip-servidor>\r\n");
+            WaitEnter();
+            Scr_Restore();
+            return;
+        }
+        // Picker
+        u8 chosen = PickServer();
+        if(chosen == 0xFF) {
+            Scr_Restore();
+            return;
+        }
+        // Set g_Ip y g_Port desde el server seleccionado.
+        g_Ip[0] = g_Servers[chosen].ip[0];
+        g_Ip[1] = g_Servers[chosen].ip[1];
+        g_Ip[2] = g_Servers[chosen].ip[2];
+        g_Ip[3] = g_Servers[chosen].ip[3];
+        g_Port  = g_Servers[chosen].port;
+    } else if(!ParseIPv4(tok1, g_Ip)) {
+        Scr_PutStr("ERROR: IP invalida\r\n");
+        WaitEnter();
+        Scr_Restore();
+        return;
+    }
+    BuildHostHeader();
+
     Scr_PutStr("Conectando con ");
     Scr_PutIP(g_Ip);
     Scr_PutChar(':');
-    Scr_PutU32((u32)NT_PORT);
+    Scr_PutU32((u32)g_Port);
     Scr_PutStr(" /_list ...\r\n");
 
     // Carga primera pagina del listado del servidor (RefreshList construye
@@ -1587,7 +1755,7 @@ void main(void)
         Scr_PutStr("  - HTTP status: ");
         Scr_PutU32((u32)g_StatusCode);
         Scr_PutStr("\r\n  - Comprueba IP, puerto ");
-        Scr_PutU32((u32)NT_PORT);
+        Scr_PutU32((u32)g_Port);
         Scr_PutStr(" y que el servidor este corriendo.\r\n");
         WaitEnter();
         Scr_Restore();

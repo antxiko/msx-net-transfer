@@ -1,5 +1,5 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.2.3 — HTTP server for MSX-DOS 2
+// nts.c — MSX Net Transfer 0.3.0 — HTTP server for MSX-DOS 2
 //
 // First implementation with HTTP: serves files from the current directory
 // over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
@@ -26,8 +26,10 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.2.3"
+#define NTS_VERSION      "0.3.0"
 #define NTS_PORT         8088
+#define NTS_DISCOVERY_PORT 8089
+#define NTS_NAME         "MSX-NTS"   // anuncio de descubrimiento
 #define MAX_FILES        256         // pagina del /_list
 #define NAME_LEN         28
 #define IDLE_LIMIT       20000
@@ -66,6 +68,8 @@ static u32 g_RequestCount;     // peticiones servidas desde arranque
 
 // ── HTTP server state ──
 static NetConn g_Listener = NET_INVALID_CONN;
+static NetConn g_UdpDisc = NET_INVALID_CONN;   // socket UDP de descubrimiento
+static u32 g_DiscoveryHits = 0;                // contador de respuestas dadas
 static u8  g_HttpRxBuf[HTTP_BODY_CHUNK];   // recv scratch + disk read
 static c8  g_HttpHdrBuf[HTTP_HDR_MAX];     // request headers acumulados
 static u16 g_HttpHdrLen;
@@ -1023,22 +1027,74 @@ static void HttpServeOne(NetConn conn)
     g_RequestCount++;
 }
 
+// ── Discovery: ANUNCIA nuestra presencia por broadcast cada ~1s ──
+//
+// Modelo announce: el server emite, el cliente solo escucha. El cliente NT
+// no envia queries — escucha estos anuncios. Throttle por JIFFY (0xFC9E),
+// que incrementa cada VBlank (~50/60Hz), asi anunciamos ~1 vez/s sin saturar.
+//
+// NOTA: enviar broadcast desde el MSX requiere que la pila UNAPI lo permita.
+// El hardware real (GR8NET, BadCat, ESP-FPGA) lo soporta; algunos bridges de
+// emulador no. Si Net_UdpSend falla simplemente no nos descubren — sin crash.
+static void Discovery_Tick(void)
+{
+    static const c8 srvName[] = NTS_NAME;
+    static const u8 bcast[4] = { 255, 255, 255, 255 };
+    static u16 lastJiffy = 0;
+    static u8  primed = 0;
+    u16 now;
+
+    if(g_UdpDisc == NET_INVALID_CONN) return;
+
+    now = *(volatile u16*)0xFC9E;       // JIFFY (system timer)
+    if(primed && (u16)(now - lastJiffy) < 50) return;   // < ~1s → todavia no
+    primed = 1;
+    lastJiffy = now;
+
+    // Construye anuncio: "NT!" + port_lo + port_hi + name_len + name
+    u8 resp[8 + sizeof(srvName)];
+    u8 i = 0;
+    resp[i++] = 'N'; resp[i++] = 'T'; resp[i++] = '!';
+    resp[i++] = (u8)(NTS_PORT & 0xFF);
+    resp[i++] = (u8)(NTS_PORT >> 8);
+    u8 nlen = sizeof(srvName) - 1;
+    resp[i++] = nlen;
+    {
+        u8 k;
+        for(k = 0; k < nlen; k++) resp[i++] = srvName[k];
+    }
+    if(Net_UdpSend(g_UdpDisc, bcast, NTS_DISCOVERY_PORT, resp, (u16)i))
+        g_DiscoveryHits++;
+}
+
 // ── lifecycle ──
 static void Http_Start(void)
 {
     if(g_Listener != NET_INVALID_CONN) return;
     g_Listener = Net_OpenPassive(NTS_PORT);
+    // Abre socket UDP para descubrimiento. Si falla, el HTTP sigue funcionando.
+    if(g_UdpDisc == NET_INVALID_CONN) {
+        g_UdpDisc = Net_UdpOpen(NTS_DISCOVERY_PORT);
+    }
 }
 
 static void Http_Stop(void)
 {
-    if(g_Listener == NET_INVALID_CONN) return;
-    Net_Abort(g_Listener);
-    g_Listener = NET_INVALID_CONN;
+    if(g_Listener != NET_INVALID_CONN) {
+        Net_Abort(g_Listener);
+        g_Listener = NET_INVALID_CONN;
+    }
+    if(g_UdpDisc != NET_INVALID_CONN) {
+        Net_UdpClose(g_UdpDisc);
+        g_UdpDisc = NET_INVALID_CONN;
+    }
 }
 
 static void Http_Tick(void)
 {
+    // Discovery responder primero — es barato y mantiene el bridge feliz
+    Discovery_Tick();
+
     if(g_Listener == NET_INVALID_CONN) return;
     u8 r = Net_AcceptIfReady(g_Listener);
     if(r == NET_ACCEPT_READY) {
