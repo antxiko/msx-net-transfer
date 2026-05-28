@@ -41,7 +41,8 @@
 #define FILTER_ALL       0
 #define FILTER_ROM       1
 #define FILTER_DSK       2
-#define FILTER_COUNT     3
+#define FILTER_CAS       3
+#define FILTER_COUNT     4
 
 //─────────────────────────────────────────────────────────────────
 // Estado global
@@ -739,9 +740,16 @@ static bool FileMatchesFilter(const c8* name)
                 LowerCaseAt(dot, 2) == 'm' &&
                 dot[3] == 0);
     }
-    return (LowerCaseAt(dot, 0) == 'd' &&
-            LowerCaseAt(dot, 1) == 's' &&
-            LowerCaseAt(dot, 2) == 'k' &&
+    if(g_FilterMode == FILTER_DSK) {
+        return (LowerCaseAt(dot, 0) == 'd' &&
+                LowerCaseAt(dot, 1) == 's' &&
+                LowerCaseAt(dot, 2) == 'k' &&
+                dot[3] == 0);
+    }
+    /* FILTER_CAS */
+    return (LowerCaseAt(dot, 0) == 'c' &&
+            LowerCaseAt(dot, 1) == 'a' &&
+            LowerCaseAt(dot, 2) == 's' &&
             dot[3] == 0);
 }
 
@@ -762,6 +770,7 @@ static void Ui_DrawFilterLabel(void)
     Scr_Locate(43, 0);   // col 34 = [SERVER]/[LOCAL], col 43 = filter
     if(g_FilterMode == FILTER_ROM)      Scr_PutStr("[ROM]");
     else if(g_FilterMode == FILTER_DSK) Scr_PutStr("[DSK]");
+    else if(g_FilterMode == FILTER_CAS) Scr_PutStr("[CAS]");
     else                                Scr_PutStr("[ALL]");
 }
 
