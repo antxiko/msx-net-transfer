@@ -1,5 +1,5 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.3.0 — HTTP server for MSX-DOS 2
+// nts.c — MSX Net Transfer 0.3.1 — HTTP server for MSX-DOS 2
 //
 // First implementation with HTTP: serves files from the current directory
 // over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
@@ -26,7 +26,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.3.0"
+#define NTS_VERSION      "0.3.1"
 #define NTS_PORT         8088
 #define NTS_DISCOVERY_PORT 8089
 #define NTS_NAME         "MSX-NTS"   // anuncio de descubrimiento
@@ -149,6 +149,14 @@ __endasm;
 //─────────────────────────────────────────────────────────────────
 // Helpers de pantalla — mismos que nt.c
 //─────────────────────────────────────────────────────────────────
+// Espera N ticks del JIFFY (0xFC9E, 50/60Hz). Independiente del reloj de CPU
+// — en Turbo R el cursor va a la MISMA velocidad que en un MSX 3.58MHz.
+static void Wait_Jiffy(u8 ticks)
+{
+    u16 t0 = *(volatile u16*)0xFC9E;
+    while((u16)(*(volatile u16*)0xFC9E - t0) < (u16)ticks) ;
+}
+
 static void Scr_Cls(void)            { DOS_CharOutput(0x0C); }
 static void Scr_Locate(u8 x, u8 y)
 {
@@ -1218,21 +1226,21 @@ void main(void)
         if(IS_KEY_PRESSED(row8, KEY_UP)) {
             if(g_Selection > 0) {
                 MoveSelection(g_Selection - 1);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+                Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             }
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_DOWN)) {
             if(g_Selection + 1 < g_FilteredCount) {
                 MoveSelection(g_Selection + 1);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+                Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             }
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_LEFT)) {
             if(g_Selection >= ROWS_PER_COL) {
                 MoveSelection(g_Selection - ROWS_PER_COL);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+                Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             }
             continue;
         }
@@ -1240,7 +1248,7 @@ void main(void)
             u8 target = g_Selection + ROWS_PER_COL;
             if(target < g_FilteredCount) {
                 MoveSelection(target);
-                { u16 d; for(d = 0; d < 4000; d++) ; }
+                Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             }
             continue;
         }

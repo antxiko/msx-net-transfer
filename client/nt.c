@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.3.0"
+#define NT_VERSION       "0.3.1"
 #define NT_PORT          8088
 #define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
@@ -185,6 +185,16 @@ __asm
     pop  ix
     ret
 __endasm;
+}
+
+// Espera N ticks del JIFFY (system timer @ 0xFC9E, 50/60Hz). Independiente
+// del reloj de CPU, asi en Turbo R el cursor va a la MISMA velocidad que en
+// un MSX 3.58MHz (antes usabamos un for() vacio CPU-dependiente → en TR el
+// cursor se desbocaba).
+static void Wait_Jiffy(u8 ticks)
+{
+    u16 t0 = *(volatile u16*)0xFC9E;
+    while((u16)(*(volatile u16*)0xFC9E - t0) < (u16)ticks) ;
 }
 
 static void Scr_Cls(void)            { DOS_CharOutput(0x0C); }
@@ -1461,7 +1471,7 @@ static void Browse(void)
                 // wrap dentro de pagina unica
                 MoveSelection(g_FilteredCount - 1);
             }
-            { u16 d; for(d = 0; d < 4000; d++) ; }
+            Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_DOWN)) {
@@ -1475,7 +1485,7 @@ static void Browse(void)
             } else if(g_FilteredCount > 0) {
                 MoveSelection(0);
             }
-            { u16 d; for(d = 0; d < 4000; d++) ; }
+            Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             continue;
         }
 
@@ -1492,7 +1502,7 @@ static void Browse(void)
             } else if(g_FilteredCount > 0) {
                 MoveSelection(g_FilteredCount - 1);
             }
-            { u16 d; for(d = 0; d < 4000; d++) ; }
+            Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             continue;
         }
         if(IS_KEY_PRESSED(row8, KEY_RIGHT)) {
@@ -1506,7 +1516,7 @@ static void Browse(void)
             } else if(g_FilteredCount > 0) {
                 MoveSelection(0);
             }
-            { u16 d; for(d = 0; d < 4000; d++) ; }
+            Wait_Jiffy(3);   // ~17Hz repeat — fixed rate, no Turbo R runaway
             continue;
         }
     }
