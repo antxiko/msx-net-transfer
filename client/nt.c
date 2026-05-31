@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.3.1"
+#define NT_VERSION       "0.3.2"
 #define NT_PORT          8088
 #define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
@@ -151,38 +151,105 @@ __asm
 __endasm;
 }
 
-static void Scr_Restore(void) __NAKED
+// Forward decls — definiciones mas abajo, necesarias porque
+// Scr_WaitAllKeysReleased / Scr_Restore se definen aqui y usan estas.
+static u8 My_Snsmat(u8 line);
+static void Kbd_FlushBuf(void);
+static void Scr_Locate(u8 x, u8 y);
+static void Scr_PutStr(const c8* s);
+static void Scr_PutU8Hex(u8 v);
+static void Scr_PutU16Hex(u16 v);
+
+// Espera a que TODAS las filas del key matrix (0..8) lean 0xFF (ninguna tecla
+// pulsada) durante 6 JIFFY consecutivos (~120ms). Esto cubre el caso de un
+// usuario "tap-tap-tap" rapido en cursor: entre tap y tap el matrix lee idle
+// momentaneo, pero si exigimos estabilidad de 120ms aseguramos que ya no esta
+// tecleando, asi nuestro KILBUF no se "salta" porque despues de el sigue
+// llegando una tecla mas al buffer via interrupt.
+static void Scr_WaitAllKeysReleased(void)
+{
+    u8 row;
+    u8 stable;
+    u16 prev;
+    stable = 0;
+    while(stable < 6) {
+        Kbd_FlushBuf();   // drena cualquier char que el BIOS encole entre iteraciones
+        u8 any = 0;
+        for(row = 0; row <= 8; row++) {
+            if(My_Snsmat(row) != 0xFF) { any = 1; break; }
+        }
+        if(any) {
+            stable = 0;
+        } else {
+            prev = *(volatile u16*)0xFC9E;
+            while(*(volatile u16*)0xFC9E == prev) ;
+            stable++;
+        }
+    }
+}
+
+// CHGMOD 0 a 80 cols + flush KEYBUF.
+static void Scr_RestoreLow(void) __NAKED
 {
 __asm
     push ix
     push iy
-    ld   a, #40
+
+    ; SCREEN 0 a 80 cols
+    ld   a, #80
     ld   (#0xF3AE), a
     ld   iy, (#0xFCC0)
-    ld   ix, #0x005F
+    ld   ix, #0x005F             ; CHGMOD
     xor  a
     call #0x001C
+
+    ; Flush KEYBUF (atomic con DI/EI): PUTPNT = GETPNT
+    di
+    ld   hl, (#0xF3FA)
+    ld   (#0xF3F8), hl
+    ei
+
     pop  iy
     pop  ix
     ret
 __endasm;
 }
 
-// Llama a SNSMAT (BIOS, $0141) con A=line via CALSLT. Devuelve la matriz en A.
-// SDCC 4.5 con --sdcccall 1 (default) pasa el primer u8 en A y devuelve
-// el u8 en A. Asi que A ya contiene 'line' al entrar y SNSMAT devuelve en A
-// — no tocamos A ni en entrada ni en salida.
+// Salida limpia: wait, flush, Cls, Bios_Exit (CHGMOD 2 + TOTEXT + DOS TERM).
+// KNOWN LIMITATION: si se pulsan cursores durante la impresion inicial de
+// la lista, al volver a DOS un cursor-UP residual del BIOS de teclado puede
+// llegar al prompt y disparar el recall del comando anterior. Pendiente de
+// resolver — ver README "Known limitations".
+static void Scr_Restore(void)
+{
+    Scr_WaitAllKeysReleased();
+    Kbd_FlushBuf();
+    Scr_Cls();
+    Bios_Exit(0);
+}
+
+// Lee una fila del matrix del teclado por I/O DIRECTO al PPI (igual que
+// `Keyboard_Read` de MSXgl, igual que MSXon). NO usa BIOS SNSMAT.
+//
+// Por que no SNSMAT: el BIOS SNSMAT cambia la fila activa del matrix via
+// PPI, pero ademas algunas implementaciones BIOS (Nextor/MSX-DOS 2) usan
+// la oportunidad para actualizar NEWKEY/OLDKEY/KEYBUF si detectan press
+// nueva — efecto secundario que llena el buffer y deja chars fantasma para
+// COMMAND2.COM al salir. El acceso directo al PPI no tiene ese efecto.
+//
+// SDCC sdcccall 1: el primer u8 entra en A. Devolvemos matriz en A.
 static u8 My_Snsmat(u8 line) __NAKED
 {
     (void)line;
 __asm
-    push ix
-    push iy
-    ld   iy, (#0xFCC0)            ; IYh = slot Main BIOS
-    ld   ix, #0x0141             ; SNSMAT
-    call #0x001C                 ; CALSLT — A=line entra, A=matriz sale
-    pop  iy
-    pop  ix
+    push bc
+    ld   c, a                    ; salvar row en C
+    in   a, (#0xAA)              ; PPI port C
+    and  #0xF0                   ; conservar bits altos
+    or   c                       ; bits bajos = row
+    out  (#0xAA), a              ; seleccionar row
+    in   a, (#0xA9)              ; leer matrix de la row → A
+    pop  bc
     ret
 __endasm;
 }
@@ -195,6 +262,22 @@ static void Wait_Jiffy(u8 ticks)
 {
     u16 t0 = *(volatile u16*)0xFC9E;
     while((u16)(*(volatile u16*)0xFC9E - t0) < (u16)ticks) ;
+}
+
+// Vacia el KEYBUF: PUTPNT = GETPNT (NO al reves). El truco es de MSXon.
+//
+// La asignacion intuitiva "GETPNT = PUTPNT" tiene una race condition: el
+// interrupt del VBlank puede saltar entre `ld hl,(PUTPNT)` y `ld (GETPNT),hl`
+// y avanzar PUTPNT — escribimos GETPNT = PUTPNT-viejo, dejando 1 char vivo
+// en el buffer que sobrevive todos los drains hasta DOS.
+//
+// "PUTPNT = GETPNT" no tiene ese problema: aunque el interrupt escriba un
+// char y avance PUTPNT, nuestra siguiente escritura sobreescribe PUTPNT
+// hacia GETPNT (atras), y el char del interrupt se pierde — exactamente lo
+// que queremos. Buffer empty garantizado.
+static void Kbd_FlushBuf(void)
+{
+    *(volatile u16*)0xF3F8 = *(volatile u16*)0xF3FA;
 }
 
 static void Scr_Cls(void)            { DOS_CharOutput(0x0C); }
@@ -214,6 +297,19 @@ static void Scr_PutChar(c8 c)        { DOS_CharOutput(c); }
 static void Scr_PutStr(const c8* s)
 {
     while(*s) { DOS_CharOutput(*s++); }
+}
+
+// Debug helpers — imprimir hex.
+static void Scr_PutU8Hex(u8 v)
+{
+    static const c8 hex[] = "0123456789ABCDEF";
+    DOS_CharOutput(hex[(v >> 4) & 0x0F]);
+    DOS_CharOutput(hex[v & 0x0F]);
+}
+static void Scr_PutU16Hex(u16 v)
+{
+    Scr_PutU8Hex((u8)(v >> 8));
+    Scr_PutU8Hex((u8)(v & 0xFF));
 }
 static void Scr_PutU32(u32 v)
 {
@@ -834,6 +930,9 @@ static void Ui_DrawListItem(u16 idx)
 {
     u8 x, y; u8 k;
     FileEntry* fe = &g_Files[g_FilteredIdx[idx]];
+    // Drena KEYBUF aqui — si el usuario tecleo durante el dibujo, sin esto
+    // los chars se acumulan y sobreviven al drain "tardio" del Browse loop.
+    Kbd_FlushBuf();
     ItemPos(idx, &x, &y);
     Scr_Locate(x, y);
     // Cursor
@@ -927,6 +1026,8 @@ static void Ui_DrawList(void)
     } else {
         Ui_UpdateCounter();
     }
+
+    Kbd_FlushBuf();
 }
 
 static void Ui_StatusClear(void)
@@ -1251,6 +1352,7 @@ static void WaitKeyRelease(void)
 {
     u8 row7, row8;
     while(1) {
+        Kbd_FlushBuf();   // drena chars que el BIOS encole mientras esperamos el release
         row7 = My_Snsmat(7);
         row8 = My_Snsmat(8);
         if((row7 & (KEY_FLAG(KEY_RETURN) | KEY_FLAG(KEY_ESC))) ==
@@ -1343,6 +1445,15 @@ static void Browse(void)
     Ui_DrawList();
 
     while(1) {
+        // Patron MSXon (linea 1636): HALT espera al VBlank, durante el cual
+        // el BIOS termina su scan de teclado y encola cualquier tecla pulsada.
+        // Inmediatamente despues, flush — la ventana entre el queue del BIOS
+        // y mi flush es de microsegundos, no de 60ms como antes.
+        __asm
+            halt
+        __endasm;
+        Kbd_FlushBuf();
+
         u8 row3 = My_Snsmat(3);     // KEY_F (row 3 bit 3)
         u8 row4 = My_Snsmat(4);     // KEY_R / KEY_L (row 4)
         u8 row5 = My_Snsmat(5);     // KEY_S (row 5)
@@ -1679,6 +1790,8 @@ void main(void)
     // modo 80. No volvemos a 40 al salir.
     Scr_Init80();
     Scr_Cls();
+    Kbd_FlushBuf();   // limpia el buffer de teclado heredado del prompt de DOS
+                      // (el ENTER que lanzo NT + lo que el usuario haya tecleado)
 
     // El crt0 de MSXgl NO zeroea la BSS — solo copia _INITIALIZER -> _INITIALIZED.
     // Asi que las "static u8/u16/..." pueden contener basura. Inicializamos a

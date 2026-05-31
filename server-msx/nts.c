@@ -1,5 +1,5 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.3.1 — HTTP server for MSX-DOS 2
+// nts.c — MSX Net Transfer 0.3.2 — HTTP server for MSX-DOS 2
 //
 // First implementation with HTTP: serves files from the current directory
 // over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
@@ -26,7 +26,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.3.1"
+#define NTS_VERSION      "0.3.2"
 #define NTS_PORT         8088
 #define NTS_DISCOVERY_PORT 8089
 #define NTS_NAME         "MSX-NTS"   // anuncio de descubrimiento
@@ -114,21 +114,61 @@ __asm
 __endasm;
 }
 
-static void Scr_Restore(void) __NAKED
+// Forward decl — definicion abajo.
+static u8 My_Snsmat(u8 line);
+static void Kbd_FlushBuf(void);
+
+// Espera 6 JIFFY consecutivos (~120ms) con todas las filas idle.
+static void Scr_WaitAllKeysReleased(void)
+{
+    u8 row;
+    u8 stable;
+    u16 prev;
+    stable = 0;
+    while(stable < 6) {
+        Kbd_FlushBuf();   // drena chars que el BIOS encole entre iteraciones
+        u8 any = 0;
+        for(row = 0; row <= 8; row++) {
+            if(My_Snsmat(row) != 0xFF) { any = 1; break; }
+        }
+        if(any) {
+            stable = 0;
+        } else {
+            prev = *(volatile u16*)0xFC9E;
+            while(*(volatile u16*)0xFC9E == prev) ;
+            stable++;
+        }
+    }
+}
+
+// CHGMOD a 80 cols + flush race-safe.
+static void Scr_RestoreLow(void) __NAKED
 {
 __asm
     push ix
     push iy
-    ld   a, #40
+    ld   a, #80
     ld   (#0xF3AE), a
     ld   iy, (#0xFCC0)
-    ld   ix, #0x005F
+    ld   ix, #0x005F             ; CHGMOD
     xor  a
     call #0x001C
+    ld   hl, (#0xF3FA)
+    ld   (#0xF3F8), hl           ; PUTPNT = GETPNT
     pop  iy
     pop  ix
     ret
 __endasm;
+}
+
+// Salida limpia: wait, flush, Cls, Bios_Exit. Mismo patron que NT.COM.
+// Ver README sobre limitacion conocida con cursores durante impresion.
+static void Scr_Restore(void)
+{
+    Scr_WaitAllKeysReleased();
+    Kbd_FlushBuf();
+    Scr_Cls();
+    Bios_Exit(0);
 }
 
 static u8 My_Snsmat(u8 line) __NAKED
@@ -155,6 +195,13 @@ static void Wait_Jiffy(u8 ticks)
 {
     u16 t0 = *(volatile u16*)0xFC9E;
     while((u16)(*(volatile u16*)0xFC9E - t0) < (u16)ticks) ;
+}
+
+// Vacia el KEYBUF: PUTPNT = GETPNT (NO al reves — el interrupt del VBlank
+// puede colarse entre lectura/escritura y dejar 1 char vivo). Truco de MSXon.
+static void Kbd_FlushBuf(void)
+{
+    *(volatile u16*)0xF3F8 = *(volatile u16*)0xF3FA;
 }
 
 static void Scr_Cls(void)            { DOS_CharOutput(0x0C); }
@@ -429,6 +476,7 @@ static void WaitKeyRelease(void)
 {
     u8 row3, row4, row5, row7, row8;
     while(1) {
+        Kbd_FlushBuf();   // drena chars encolados por el BIOS mientras esperamos
         row3 = My_Snsmat(3);   // KEY_C, KEY_D, KEY_F
         row4 = My_Snsmat(4);   // KEY_L, KEY_R, KEY_O
         row5 = My_Snsmat(5);   // KEY_S, KEY_U
@@ -1129,6 +1177,7 @@ void main(void)
 {
     Scr_Init80();
     Scr_Cls();
+    Kbd_FlushBuf();   // limpia el buffer heredado del prompt de DOS
 
     // BSS init manual (MSXgl crt0 no la zerea — ver memorias del proyecto)
     g_FileCount     = 0;
@@ -1157,6 +1206,11 @@ void main(void)
 
     // Bucle principal — por ahora solo procesa teclas (sin HTTP)
     while(1) {
+        // NTS lee teclado por SNSMAT, no usa KEYBUF. Pero el BIOS sigue
+        // encolando teclas — si dejamos que se llene, al salir DOS las recibe
+        // como historial fantasma. Lo mantenemos vacio cada vuelta.
+        Kbd_FlushBuf();
+
         u8 row3 = My_Snsmat(3);   // KEY_F (3,3), KEY_D (3,1)
         u8 row4 = My_Snsmat(4);   // KEY_R (4,7), KEY_L (4,1), KEY_O (4,4)
         u8 row5 = My_Snsmat(5);   // KEY_S (5,0), KEY_U (5,2)

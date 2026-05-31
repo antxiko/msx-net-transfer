@@ -127,6 +127,10 @@ Filenames longer than 8.3 are converted to uppercase 8.3 when written to MSX dis
 
 The server is intentionally read-only. It exposes only `GET`/`HEAD` and never writes anything to disk.
 
+## Known limitations
+
+- **Keyboard buffer residual on exit**: if you press cursor keys *while* the file list is still being drawn on screen (after launching `NT` or after switching views with `L`/`S`), on exit to MSX-DOS a residual cursor-UP can reach `COMMAND2.COM` and trigger a history recall — making the previous command (e.g. `NT.COM`) appear on the prompt. Pressing keys *after* the list is fully drawn does not have this issue. We haven't been able to fully pin down the root cause yet; the workarounds we tried (KILBUF, manual PUTPNT/GETPNT clear, DI/EI windows, BIOS auto-repeat counter reset, mode-transition resets via `Bios_Exit`) all reduced but didn't eliminate it for the "press during draw" case. Help/patches welcome.
+
 ## Network requirements
 
 - The MSX and the PC must be reachable from each other on the LAN.
