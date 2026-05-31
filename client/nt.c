@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.3.2"
+#define NT_VERSION       "0.3.3"
 #define NT_PORT          8088
 #define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
@@ -155,6 +155,7 @@ __endasm;
 // Scr_WaitAllKeysReleased / Scr_Restore se definen aqui y usan estas.
 static u8 My_Snsmat(u8 line);
 static void Kbd_FlushBuf(void);
+static void Kbd_DrainBdos(void);
 static void Scr_Locate(u8 x, u8 y);
 static void Scr_PutStr(const c8* s);
 static void Scr_PutU8Hex(u8 v);
@@ -223,7 +224,7 @@ __endasm;
 static void Scr_Restore(void)
 {
     Scr_WaitAllKeysReleased();
-    Kbd_FlushBuf();
+    Kbd_DrainBdos();   // patron NestorWeb — BDOS DIRIO resetea estado del BIOS
     Scr_Cls();
     Bios_Exit(0);
 }
@@ -264,20 +265,28 @@ static void Wait_Jiffy(u8 ticks)
     while((u16)(*(volatile u16*)0xFC9E - t0) < (u16)ticks) ;
 }
 
-// Vacia el KEYBUF: PUTPNT = GETPNT (NO al reves). El truco es de MSXon.
-//
-// La asignacion intuitiva "GETPNT = PUTPNT" tiene una race condition: el
-// interrupt del VBlank puede saltar entre `ld hl,(PUTPNT)` y `ld (GETPNT),hl`
-// y avanzar PUTPNT — escribimos GETPNT = PUTPNT-viejo, dejando 1 char vivo
-// en el buffer que sobrevive todos los drains hasta DOS.
-//
-// "PUTPNT = GETPNT" no tiene ese problema: aunque el interrupt escriba un
-// char y avance PUTPNT, nuestra siguiente escritura sobreescribe PUTPNT
-// hacia GETPNT (atras), y el char del interrupt se pierde — exactamente lo
-// que queremos. Buffer empty garantizado.
+// Drain rapido via PUTPNT=GETPNT — usado en bucles internos (Browse, etc).
 static void Kbd_FlushBuf(void)
 {
     *(volatile u16*)0xF3F8 = *(volatile u16*)0xF3FA;
+}
+
+// Drain via BDOS DIRIO ($06 con E=$FF) en bucle — usado SOLO al salir, una
+// vez. Pasa por la ruta oficial BDOS/BIOS, resetea estado interno del BIOS
+// (auto-repeat) que PUTPNT=GETPNT deja colgado. Si esto se llamara dentro
+// del loop principal (ej. cada item de la lista), la frecuencia de BDOS
+// calls rompe el HTTP fetch — por eso solo aqui.
+static void Kbd_DrainBdos(void) __NAKED
+{
+__asm
+00001$:
+    ld   e, #0xFF
+    ld   c, #0x06
+    call #0x0005
+    or   a
+    jr   nz, 00001$
+    ret
+__endasm;
 }
 
 static void Scr_Cls(void)            { DOS_CharOutput(0x0C); }

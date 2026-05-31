@@ -1,5 +1,5 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.3.2 — HTTP server for MSX-DOS 2
+// nts.c — MSX Net Transfer 0.3.3 — HTTP server for MSX-DOS 2
 //
 // First implementation with HTTP: serves files from the current directory
 // over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
@@ -26,7 +26,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.3.2"
+#define NTS_VERSION      "0.3.3"
 #define NTS_PORT         8088
 #define NTS_DISCOVERY_PORT 8089
 #define NTS_NAME         "MSX-NTS"   // anuncio de descubrimiento
@@ -117,6 +117,7 @@ __endasm;
 // Forward decl — definicion abajo.
 static u8 My_Snsmat(u8 line);
 static void Kbd_FlushBuf(void);
+static void Kbd_DrainBdos(void);
 
 // Espera 6 JIFFY consecutivos (~120ms) con todas las filas idle.
 static void Scr_WaitAllKeysReleased(void)
@@ -161,12 +162,11 @@ __asm
 __endasm;
 }
 
-// Salida limpia: wait, flush, Cls, Bios_Exit. Mismo patron que NT.COM.
-// Ver README sobre limitacion conocida con cursores durante impresion.
+// Salida limpia: wait, BDOS DIRIO drain (resetea estado BIOS), Cls, Bios_Exit.
 static void Scr_Restore(void)
 {
     Scr_WaitAllKeysReleased();
-    Kbd_FlushBuf();
+    Kbd_DrainBdos();
     Scr_Cls();
     Bios_Exit(0);
 }
@@ -197,11 +197,27 @@ static void Wait_Jiffy(u8 ticks)
     while((u16)(*(volatile u16*)0xFC9E - t0) < (u16)ticks) ;
 }
 
-// Vacia el KEYBUF: PUTPNT = GETPNT (NO al reves — el interrupt del VBlank
-// puede colarse entre lectura/escritura y dejar 1 char vivo). Truco de MSXon.
+// Drain rapido via PUTPNT=GETPNT — usado en bucles internos.
 static void Kbd_FlushBuf(void)
 {
     *(volatile u16*)0xF3F8 = *(volatile u16*)0xF3FA;
+}
+
+// Drain via BDOS DIRIO ($06 con E=$FF) — patron NestorWeb. Pasa por la ruta
+// oficial BDOS/BIOS y resetea estado interno (auto-repeat) que PUTPNT=GETPNT
+// deja colgado, evitando 1 char fantasma al volver a COMMAND2.COM. Llamado
+// SOLO al exit (en loops es demasiado pesado y rompe HTTP).
+static void Kbd_DrainBdos(void) __NAKED
+{
+__asm
+00001$:
+    ld   e, #0xFF
+    ld   c, #0x06
+    call #0x0005
+    or   a
+    jr   nz, 00001$
+    ret
+__endasm;
 }
 
 static void Scr_Cls(void)            { DOS_CharOutput(0x0C); }
