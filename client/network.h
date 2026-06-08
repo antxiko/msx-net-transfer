@@ -83,7 +83,11 @@ static u8 Net_Send(NetConn conn, const u8* data, u16 length)
 {
     int err = tcpip_tcp_send((int)conn, (char*)data, (int)length, 1);
     if(err != ERR_OK) return NET_ERROR;
-    tcpip_tcp_flush((int)conn);
+    // [FIX INL 2026-06-06] NO tcpip_tcp_flush: la funcion UNAPI #19 es TCPIP_TCP_DISCARD
+    // (borra el buffer de salida AUN NO enviado), NO un flush. En INL (envio diferido al
+    // processing step del timer) borraba la peticion antes de transmitirla. El push=1 del
+    // send ya fuerza el envio. GR8NET/UnapiNet no se veian afectados (envian en la llamada).
+    // tcpip_tcp_flush((int)conn);
     return NET_OK;
 }
 

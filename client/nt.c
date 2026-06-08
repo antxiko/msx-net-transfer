@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.3.3"
+#define NT_VERSION       "0.3.4"
 #define NT_PORT          8088
 #define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
@@ -509,7 +509,9 @@ static u16 WaitForData(NetConn conn)
 {
     u16 idle = 0;
     while(1) {
-        u16 avail = Net_Available(conn);
+        u16 avail;
+        EnableInterrupt();   // [FIX INL] timer activo => INL procesa rx en su processing step
+        avail = Net_Available(conn);
         if(avail > 0) return avail;
         if(!Net_IsConnected(conn)) return Net_Available(conn);
         if(++idle > IDLE_LIMIT) return 0;
@@ -590,6 +592,7 @@ static bool HttpFetch(const c8* path, HttpSink* sink)
         u16 idle = 0;
         TRACE('W');                   // wait connected
         while(!Net_IsConnected(conn)) {
+            EnableInterrupt();        // [FIX INL] timer activo => INL completa el handshake
             if(++idle > IDLE_LIMIT) { TRACE('t'); Net_Abort(conn); return FALSE; }
         }
         TRACE('w');                   // connected
@@ -1208,6 +1211,7 @@ static u16 DoUpload(const c8* localName, bool forceOverwrite)
     {
         u16 idle = 0;
         while(!Net_IsConnected(conn)) {
+            EnableInterrupt();        // [FIX INL] timer activo => INL completa el handshake
             if(++idle > IDLE_LIMIT) {
                 Net_Abort(conn); DOS_CloseHandle(fh); return 1;
             }
@@ -1236,6 +1240,7 @@ static u16 DoUpload(const c8* localName, bool forceOverwrite)
     while(sent < fileSize) {
         u16 want, got;
         u8  row7;
+        EnableInterrupt();            // [FIX INL] timer activo => INL transmite lo encolado
         want = (fileSize - sent > RX_BUF_SIZE) ? RX_BUF_SIZE : (u16)(fileSize - sent);
         got  = DOS_ReadHandle(fh, g_RxBuf, want);
         if(got == 0) { Net_Abort(conn); DOS_CloseHandle(fh); return 1; }
@@ -1263,7 +1268,9 @@ static u16 DoUpload(const c8* localName, bool forceOverwrite)
         bool hdrDone = FALSE;
         u16  idle = 0;
         while(!hdrDone) {
-            u16 avail = Net_Available(conn);
+            u16 avail;
+            EnableInterrupt();        // [FIX INL] timer activo => INL procesa rx
+            avail = Net_Available(conn);
             if(avail == 0) {
                 if(!Net_IsConnected(conn)) break;
                 if(++idle > IDLE_LIMIT) break;

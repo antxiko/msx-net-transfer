@@ -1,5 +1,5 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.3.3 — HTTP server for MSX-DOS 2
+// nts.c — MSX Net Transfer 0.3.4 — HTTP server for MSX-DOS 2
 //
 // First implementation with HTTP: serves files from the current directory
 // over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
@@ -26,7 +26,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.3.3"
+#define NTS_VERSION      "0.3.4"
 #define NTS_PORT         8088
 #define NTS_DISCOVERY_PORT 8089
 #define NTS_NAME         "MSX-NTS"   // anuncio de descubrimiento
@@ -615,6 +615,7 @@ static bool HttpReadHeaders(NetConn conn)
     u16 idle = 0;
     g_HttpHdrLen = 0;
     while(1) {
+        EnableInterrupt();   // [FIX INL] timer activo => INL procesa rx en su processing step
         u16 avail = Net_Available(conn);
         if(avail == 0) {
             if(!Net_IsConnected(conn)) return FALSE;
@@ -895,6 +896,7 @@ static void HttpHandleGetFile(NetConn conn, const c8* path)
 
     // Body
     while(length > 0) {
+        EnableInterrupt();   // [FIX INL] timer activo => INL transmite lo encolado
         u16 want = (length > HTTP_BODY_CHUNK) ? HTTP_BODY_CHUNK : (u16)length;
         u16 got = DOS_ReadHandle(fh, g_HttpRxBuf, want);
         if(got == 0) break;
@@ -966,6 +968,7 @@ static void HttpHandlePut(NetConn conn)
     {
         u16 idle = 0;
         while(remaining > 0) {
+            EnableInterrupt();   // [FIX INL] timer activo => INL procesa rx
             u16 avail = Net_Available(conn);
             if(avail == 0) {
                 if(!Net_IsConnected(conn)) { ok = FALSE; break; }

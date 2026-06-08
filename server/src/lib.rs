@@ -1342,3 +1342,33 @@ fn serve_listing(
     }
     Ok(sent)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // El puerto de discovery va emparejado con NT.COM (NT_DISCOVERY_PORT en client/nt.c).
+    // Si cambia, hay que actualizar ambos lados o el discovery deja de cuadrar.
+    #[test]
+    fn discovery_port_matches_protocol_constant() {
+        assert_eq!(DISCOVERY_PORT, 8089);
+    }
+
+    // default_host_name_string() es la fuente del campo "name" del paquete de
+    // discovery; si devuelve string vacio el cliente vera un server sin nombre.
+    #[test]
+    fn default_host_name_is_nonempty() {
+        let n = default_host_name_string();
+        assert!(!n.is_empty(), "default_host_name_string() devolvio cadena vacia");
+    }
+
+    // ServerConfig::default debe tener discovery=true y bind 0.0.0.0:8088 para
+    // que el comportamiento "out of the box" del binario CLI/GUI sea el esperado.
+    #[test]
+    fn server_config_defaults_are_sane() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.discovery, "discovery deberia venir activado por defecto");
+        assert_eq!(cfg.bind_addr.port(), 8088, "puerto HTTP por defecto debe ser 8088");
+        assert!(!cfg.writable, "writable debe venir desactivado por defecto (read-only)");
+    }
+}

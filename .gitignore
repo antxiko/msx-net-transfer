@@ -43,6 +43,9 @@ release-staging/
 #                              server-msx/nestorweb-reference
 server-msx/nestorweb-reference/
 
+# ── Diagnostico ObsoNET (prueba local hasta que tengamos resultados) ─
+obso/
+
 # ── Editor / IDE / SO ────────────────────────────────────────────
 .idea/
 .vscode/

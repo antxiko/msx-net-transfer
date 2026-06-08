@@ -1,0 +1,17 @@
+{
+  "min_tests": 1,
+  "checks": [
+    {
+      "name": "cargo-test",
+      "command": "cargo test --release --manifest-path server/Cargo.toml",
+      "required": true,
+      "is_test": true
+    },
+    {
+      "name": "cargo-build",
+      "command": "cargo build --release --manifest-path server/Cargo.toml",
+      "required": true,
+      "is_test": false
+    }
+  ]
+}
