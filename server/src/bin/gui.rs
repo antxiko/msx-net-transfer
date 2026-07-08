@@ -12,12 +12,49 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use eframe::egui;
 use nettransfer_server::{local_ipv4s, Server, ServerConfig, ServerEvent};
+
+// ── Log a fichero para arranque en Windows: el GUI usa windows_subsystem="windows",
+// por lo que un panic o error inicial no se ve en ninguna consola. Escribimos junto
+// al exe si podemos (util cuando se lanza haciendo doble-clic desde el ZIP), y si
+// no, en el CWD.
+fn log_file_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.join("nthttp-gui.log");
+        }
+    }
+    PathBuf::from("nthttp-gui.log")
+}
+
+fn log_line(msg: &str) {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let m = LOCK.get_or_init(|| Mutex::new(()));
+    let _g = m.lock();
+    let path = log_file_path();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log_line(&format!("PANIC: {}", info));
+        default(info);
+    }));
+}
 
 const DEFAULT_PORT: u16 = 8088;
 const DEFAULT_FOLDER: &str = "./files";
@@ -69,16 +106,24 @@ impl App {
         let theme = Theme::Dark;
         apply_theme(&cc.egui_ctx, theme);
 
-        let folder = fs::canonicalize(PathBuf::from(DEFAULT_FOLDER))
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_FOLDER));
+        let (folder, folder_err) = match fs::canonicalize(PathBuf::from(DEFAULT_FOLDER)) {
+            Ok(p) => (p, None),
+            Err(e) => (
+                PathBuf::from(DEFAULT_FOLDER),
+                Some(format!("carpeta por defecto {} no accesible: {}. Elige otra con el selector.",
+                             DEFAULT_FOLDER, e)),
+            ),
+        };
+        log_line(&format!("App::new: folder={} err={:?}", folder.display(), folder_err));
 
         let server_name = initial_name
             .unwrap_or_else(nettransfer_server::default_host_name_string);
+        log_line(&format!("App::new: server_name={}", server_name));
 
         let mut app = App {
             folder,
             server: None,
-            last_error: None,
+            last_error: folder_err,
             files: Vec::new(),
             ips: local_ipv4s(),
             theme,
@@ -645,6 +690,19 @@ fn human_size(n: u64) -> String {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    install_panic_hook();
+    log_line("=== nthttp-gui startup ===");
+    log_line(&format!("version: {}", env!("CARGO_PKG_VERSION")));
+    match std::env::current_dir() {
+        Ok(p) => log_line(&format!("cwd: {}", p.display())),
+        Err(e) => log_line(&format!("cwd: <err: {}>", e)),
+    }
+    match std::env::current_exe() {
+        Ok(p) => log_line(&format!("exe: {}", p.display())),
+        Err(e) => log_line(&format!("exe: <err: {}>", e)),
+    }
+    log_line(&format!("log file: {}", log_file_path().display()));
+
     // Parse --name <NAME> override (todo lo demas se configura desde la GUI).
     let mut initial_name: Option<String> = None;
     let mut args = std::env::args().skip(1);
@@ -663,9 +721,15 @@ fn main() -> Result<(), eframe::Error> {
             .with_title("NetTransfer Server"),
         ..Default::default()
     };
-    eframe::run_native(
+    log_line("calling eframe::run_native");
+    let result = eframe::run_native(
         "NetTransfer Server",
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, initial_name.clone())))),
-    )
+    );
+    match &result {
+        Ok(()) => log_line("eframe::run_native returned Ok"),
+        Err(e) => log_line(&format!("eframe::run_native returned Err: {}", e)),
+    }
+    result
 }

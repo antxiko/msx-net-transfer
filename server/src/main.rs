@@ -60,9 +60,37 @@ fn main() {
         if let Ok(n) = p.parse::<u16>() { port = n; }
         else { eprintln!("[ERR] Bad port: {}", p); std::process::exit(2); }
     }
+    let user_gave_root = positionals.get(1).is_some();
     if let Some(d) = positionals.get(1) {
         root = PathBuf::from(d);
     }
+
+    let cwd_display = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<no-cwd>".into());
+
+    // Si la raiz no existe:
+    //  - default (./files): la creamos (mejora la primera ejecucion tras descomprimir).
+    //  - custom: error claro con la ruta absoluta que se intento, en vez de "os error 2".
+    if !root.exists() {
+        if user_gave_root {
+            eprintln!("[ERR] Directorio no encontrado: {}", root.display());
+            eprintln!("[ERR] CWD actual: {}", cwd_display);
+            eprintln!("[ERR] Crea la carpeta o pasa una ruta valida como segundo argumento (ej: nthttp 8088 C:\\misfichero).");
+            std::process::exit(1);
+        } else if let Err(e) = std::fs::create_dir_all(&root) {
+            eprintln!("[ERR] No pude crear el directorio por defecto {}: {}", root.display(), e);
+            eprintln!("[ERR] CWD actual: {}", cwd_display);
+            eprintln!("[ERR] Comprueba permisos de escritura en la carpeta actual o pasa otra ruta como segundo argumento.");
+            std::process::exit(1);
+        } else {
+            eprintln!("[INFO] Directorio por defecto {} no existia; lo he creado.", root.display());
+        }
+    }
+
+    let root_abs = std::fs::canonicalize(&root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| root.display().to_string());
 
     let cfg = ServerConfig {
         bind_addr: SocketAddr::from(([0, 0, 0, 0], port)),
@@ -77,12 +105,15 @@ fn main() {
     let server = match Server::start(cfg) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[ERR] {}", e);
+            eprintln!("[ERR] No pude arrancar el server: {}", e);
+            eprintln!("[ERR] CWD: {}", cwd_display);
+            eprintln!("[ERR] Raiz (absoluta): {}", root_abs);
+            eprintln!("[ERR] Hint: revisa permisos del directorio o pasa otra ruta como segundo argumento.");
             std::process::exit(1);
         }
     };
 
-    print_banner(server.root().display().to_string(), server.local_addr().port(), writable, overwrite, max_upload);
+    print_banner(cwd_display, server.root().display().to_string(), server.local_addr().port(), writable, overwrite, max_upload);
 
     // Bucle de eventos: imprime cada peticion.
     loop {
@@ -143,9 +174,10 @@ fn print_help() {
     println!("  -h, --help           Esta ayuda");
 }
 
-fn print_banner(root: String, port: u16, writable: bool, overwrite: bool, max_upload: u64) {
+fn print_banner(cwd: String, root: String, port: u16, writable: bool, overwrite: bool, max_upload: u64) {
     println!("=========================================================");
     println!(" MSX Net Transfer HTTP server");
+    println!(" CWD:  {}", cwd);
     println!(" Raiz: {}", root);
     println!(" Puerto: {}", port);
     println!(" Uploads: {}{}",
