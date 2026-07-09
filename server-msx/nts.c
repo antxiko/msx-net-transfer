@@ -1,5 +1,5 @@
 //=============================================================================
-// nts.c — MSX Net Transfer 0.3.5 — HTTP server for MSX-DOS 2
+// nts.c — MSX Net Transfer 0.3.6 — HTTP server for MSX-DOS 2
 //
 // First implementation with HTTP: serves files from the current directory
 // over HTTP/1.0. Matches the Rust server's protocol so NT.COM and curl can
@@ -26,7 +26,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NTS_VERSION      "0.3.5"
+#define NTS_VERSION      "0.3.6"
 #define NTS_PORT         8088
 #define NTS_DISCOVERY_PORT 8089
 #define NTS_NAME         "MSX-NTS"   // anuncio de descubrimiento

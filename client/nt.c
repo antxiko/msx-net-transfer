@@ -29,7 +29,7 @@
 #include "bios_var.h"
 #include "input.h"
 
-#define NT_VERSION       "0.3.5"
+#define NT_VERSION       "0.3.6"
 #define NT_PORT          8088
 #define MAX_FILES        256         // tamaño de pagina, NO cap de carpeta
 #define NAME_LEN         28          // 27 + NUL
