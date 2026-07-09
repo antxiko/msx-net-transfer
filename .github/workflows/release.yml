@@ -54,23 +54,20 @@ jobs:
             cross: true
             include_gui: false
           - os: macos-latest
-            target: aarch64-apple-darwin
-            label: macos-arm64
+            target: universal-apple-darwin
+            label: macos-universal
             archive: tar.gz
             cli: nthttp
             gui: nthttp-gui
             cross: false
             include_gui: true
-          # NOTA: macos-13 (Intel Mac) runners en GitHub Actions tienen colas
-          # de espera muy largas (10-30+ min). Para usuarios de Mac Intel,
-          # el binario arm64 corre sin problema bajo Rosetta. Si en algun
-          # futuro release quieres binario nativo Intel, anade aqui:
-          #   - os: macos-13
-          #     target: x86_64-apple-darwin
-          #     label: macos-x86_64
-          #     archive: tar.gz
-          #     cli: nthttp
-          #     gui: nthttp-gui
+            # Universal binary = arm64 + x86_64 fat con lipo. Un solo
+            # binario corre nativo en Apple Silicon Y en Intel Mac.
+            # Se compila desde macos-latest (arm) con ambos targets
+            # instalados via rustup: los SDKs de Xcode soportan cross
+            # trivialmente en el mismo runner (evitamos las colas
+            # eternas de macos-13 para Intel).
+            universal_macos: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
@@ -89,7 +86,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          # Para el universal macOS instalamos ambos targets; para el
+          # resto, solo el que toque. Cargo lo ignora si sobra.
+          targets: ${{ matrix.universal_macos && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -105,8 +104,24 @@ jobs:
         run: cargo install cross --locked --version 0.2.5
 
       - name: Build (release, cargo)
-        if: matrix.cross == false
+        if: matrix.cross == false && matrix.universal_macos != true
         run: cargo build --release --target ${{ matrix.target }} --bins
+
+      - name: Build (release, universal macOS via lipo)
+        if: matrix.universal_macos == true
+        shell: bash
+        run: |
+          cargo build --release --target aarch64-apple-darwin --bins
+          cargo build --release --target x86_64-apple-darwin  --bins
+          mkdir -p target/universal-apple-darwin/release
+          for bin in nthttp nthttp-gui; do
+            lipo -create -output "target/universal-apple-darwin/release/${bin}" \
+              "target/aarch64-apple-darwin/release/${bin}" \
+              "target/x86_64-apple-darwin/release/${bin}"
+            echo "--- ${bin} ---"
+            file "target/universal-apple-darwin/release/${bin}"
+            lipo -info "target/universal-apple-darwin/release/${bin}"
+          done
 
       - name: Build (release, cross)
         if: matrix.cross
@@ -186,7 +201,7 @@ jobs:
               - `msx-net-transfer-linux-x86_64.tar.gz`
               - `msx-net-transfer-linux-arm64.tar.gz` (Raspberry Pi 64-bit / Raspbian 12+ — CLI only)
               - `msx-net-transfer-linux-armhf.tar.gz` (Raspberry Pi 32-bit incl. Pi 1 / Zero — CLI only)
-              - `msx-net-transfer-macos-arm64.tar.gz` (Apple Silicon)
+              - `msx-net-transfer-macos-universal.tar.gz` (universal binary: Apple Silicon + Intel Mac, corre nativo en ambos)
             - **MSX client** `NT.COM` is included inside each archive (it's the same binary on every platform).
 
             See [README](https://github.com/${{ github.repository }}/blob/main/README.md) for installation and usage instructions.
