@@ -26,12 +26,30 @@ jobs:
             archive: tar.gz
             cli: nthttp
             gui: nthttp-gui
+            cross: false
+            include_gui: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            label: linux-arm64
+            archive: tar.gz
+            cli: nthttp
+            gui: nthttp-gui
+            # cross docker-based (Debian buster) → binario compatible con
+            # Raspbian 12 / Debian 12 (glibc 2.28+). GUI omitida en este
+            # build: cross-compilar eframe+wgpu+wayland+x11 para arm64
+            # requiere pre-instalar las libs :arm64 y no aporta al uso
+            # tipico del Pi (headless). Los usuarios que quieran GUI en
+            # RPi pueden `cargo install` desde fuente.
+            cross: true
+            include_gui: false
           - os: macos-latest
             target: aarch64-apple-darwin
             label: macos-arm64
             archive: tar.gz
             cli: nthttp
             gui: nthttp-gui
+            cross: false
+            include_gui: true
           # NOTA: macos-13 (Intel Mac) runners en GitHub Actions tienen colas
           # de espera muy largas (10-30+ min). Para usuarios de Mac Intel,
           # el binario arm64 corre sin problema bajo Rosetta. Si en algun
@@ -48,6 +66,8 @@ jobs:
             archive: zip
             cli: nthttp.exe
             gui: nthttp-gui.exe
+            cross: false
+            include_gui: true
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -69,15 +89,35 @@ jobs:
             server/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('server/Cargo.lock') }}
 
-      - name: Build (release)
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build (release, cargo)
+        if: matrix.cross == false
         run: cargo build --release --target ${{ matrix.target }} --bins
+
+      - name: Build (release, cross)
+        if: matrix.cross
+        shell: bash
+        run: |
+          # Cross busca Cargo.toml en el pwd; el default `working-directory: server`
+          # ya nos coloca ahi. --bin nthttp para arm64: sin GUI (ver comentario en
+          # el matrix).
+          if [ "${{ matrix.include_gui }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --bins
+          else
+            cross build --release --target ${{ matrix.target }} --bin nthttp
+          fi
 
       - name: Stage binaries
         shell: bash
         run: |
           mkdir -p ../dist/msx-net-transfer-${{ matrix.label }}
           cp target/${{ matrix.target }}/release/${{ matrix.cli }} ../dist/msx-net-transfer-${{ matrix.label }}/
-          cp target/${{ matrix.target }}/release/${{ matrix.gui }} ../dist/msx-net-transfer-${{ matrix.label }}/
+          if [ "${{ matrix.include_gui }}" = "true" ]; then
+            cp target/${{ matrix.target }}/release/${{ matrix.gui }} ../dist/msx-net-transfer-${{ matrix.label }}/
+          fi
           cp ../README.md ../dist/msx-net-transfer-${{ matrix.label }}/
           cp ../LICENSE   ../dist/msx-net-transfer-${{ matrix.label }}/
           cp ../client/nt.com     ../dist/msx-net-transfer-${{ matrix.label }}/NT.COM
@@ -130,11 +170,11 @@ jobs:
 
             ## What's in this release
 
-            - **Server binaries** (`nthttp` CLI + `nthttp-gui` desktop GUI):
+            - **Server binaries** (`nthttp` CLI + `nthttp-gui` desktop GUI, salvo Raspberry Pi):
               - `msx-net-transfer-windows-x86_64.zip`
               - `msx-net-transfer-linux-x86_64.tar.gz`
+              - `msx-net-transfer-linux-arm64.tar.gz` (Raspberry Pi 64-bit / Raspbian 12+ — CLI only)
               - `msx-net-transfer-macos-arm64.tar.gz` (Apple Silicon)
-              - `msx-net-transfer-macos-x86_64.tar.gz` (Intel Macs)
             - **MSX client** `NT.COM` is included inside each archive (it's the same binary on every platform).
 
             See [README](https://github.com/${{ github.repository }}/blob/main/README.md) for installation and usage instructions.
