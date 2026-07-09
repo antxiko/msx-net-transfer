@@ -42,6 +42,17 @@ jobs:
             # RPi pueden `cargo install` desde fuente.
             cross: true
             include_gui: false
+          - os: ubuntu-latest
+            target: arm-unknown-linux-gnueabihf
+            label: linux-armhf
+            archive: tar.gz
+            cli: nthttp
+            gui: nthttp-gui
+            # ARMv6 hardware-float: cubre Raspberry Pi OS 32-bit en TODOS
+            # los modelos (Pi 1, Zero, 2, 3, 4, 5 en modo 32-bit). El OS
+            # oficial targetea esta ISA. Solo CLI (mismo criterio que arm64).
+            cross: true
+            include_gui: false
           - os: macos-latest
             target: aarch64-apple-darwin
             label: macos-arm64
@@ -174,6 +185,7 @@ jobs:
               - `msx-net-transfer-windows-x86_64.zip`
               - `msx-net-transfer-linux-x86_64.tar.gz`
               - `msx-net-transfer-linux-arm64.tar.gz` (Raspberry Pi 64-bit / Raspbian 12+ — CLI only)
+              - `msx-net-transfer-linux-armhf.tar.gz` (Raspberry Pi 32-bit incl. Pi 1 / Zero — CLI only)
               - `msx-net-transfer-macos-arm64.tar.gz` (Apple Silicon)
             - **MSX client** `NT.COM` is included inside each archive (it's the same binary on every platform).
 
